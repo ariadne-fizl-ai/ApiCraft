@@ -1,0 +1,29 @@
+[package]
+name = "apicraft-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "apicraft-agent"
+path = "src/main.rs"
+
+[dependencies]
+apicraft-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+pollster = "0.4"
+dirs = "7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

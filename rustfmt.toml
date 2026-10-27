@@ -1,0 +1,3 @@
+# Wide lines suit this codebase (long builder chains and format strings).
+max_width = 160
+use_small_heuristics = "Max"

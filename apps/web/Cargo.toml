@@ -1,0 +1,39 @@
+[package]
+name = "apicraft-web"
+description = "Fizl ApiCraft in the browser (the egui UI compiled to WebAssembly)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Native launcher: builds the wasm app and serves it (see src/main.rs).
+[[bin]]
+name = "apicraft-web"
+path = "src/main.rs"
+
+[dependencies]
+apicraft-core = { path = "../../crates/core" }
+apicraft-ui = { path = "../../crates/ui-egui" }
+egui = { workspace = true }
+serde_json.workspace = true
+
+# Only the WebAssembly build has a browser to talk to.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { workspace = true, features = ["glow", "default_fonts", "persistence"] }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+rfd = "0.17"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "AbortController", "AbortSignal", "BinaryType", "Blob", "BlobPropertyBag", "CloseEvent", "Document", "Element",
+  "Event", "EventTarget", "Headers", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlElement", "Location",
+  "MessageEvent", "Performance", "Request", "RequestCredentials", "RequestInit", "RequestMode", "RequestRedirect",
+  "Response", "Storage", "Url", "WebSocket", "Window",
+]

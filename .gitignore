@@ -1,0 +1,5 @@
+/target
+/dist
+*.tmp
+# IDE state (shared run configurations live in .run/)
+/.idea/

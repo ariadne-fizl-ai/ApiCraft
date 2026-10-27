@@ -1,0 +1,25 @@
+[package]
+name = "apicraft-desktop"
+description = "Fizl ApiCraft for Windows, macOS and Linux (native egui app)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fizl-apicraft"
+path = "src/main.rs"
+
+[dependencies]
+apicraft-core = { path = "../../crates/core" }
+apicraft-agent = { path = "../../crates/agent" }
+apicraft-ui = { path = "../../crates/ui-egui" }
+egui = { workspace = true }
+eframe = { workspace = true, features = ["wgpu", "default_fonts", "persistence", "accesskit", "clipboard", "links", "wayland", "x11"] }
+rfd = "0.17"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+webbrowser = "1"
+pollster = "0.4"
+
+[build-dependencies]
+winresource = "0.1"

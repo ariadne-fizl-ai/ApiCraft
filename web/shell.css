@@ -1,0 +1,12 @@
+/* Page shell for the egui canvas, in the Nullify.WebMail palette so the
+   first paint matches the app. */
+:root { color-scheme: light dark; --bg: #ffffff; --muted: #6b7385; --track: #eceef2; --accent: #3b5bdb; }
+@media (prefers-color-scheme: dark) { :root { --bg: #16191f; --muted: #8f97a8; --track: #232831; --accent: #6d8cff; } }
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
+#app { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+.loading {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .75rem;
+    font: 14px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--muted); pointer-events: none;
+}
+.spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--track); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
