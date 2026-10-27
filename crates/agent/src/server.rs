@@ -267,17 +267,35 @@ fn api_route(req: &Req, api: &str, cfg: &Config, cross_origin: bool) -> Resp {
                 Err(e) => Resp::json(502, &ProxyError { error: e }),
             }
         }
-        ("GET", "catalog") => match std::fs::read(&cfg.data_file) {
-            Ok(bytes) => Resp::new(200, "application/gzip", bytes),
+        ("GET", "catalog") => match crate::folders::load(&cfg.data_file) {
+            Ok((cat, _)) => Resp::new(200, "application/gzip", apicraft_core::store::to_gzip(&cat)),
             Err(_) => Resp::text(404, "no catalog file yet"),
         },
         ("PUT", "catalog") => {
-            if apicraft_core::store::decode(&req.body).is_err() {
-                return Resp::text(400, "not a catalog");
-            }
-            match write_atomic(&cfg.data_file, &req.body) {
+            let cat = match apicraft_core::store::decode(&req.body) {
+                Ok(c) => c.into_catalog(),
+                Err(_) => return Resp::text(400, "not a catalog"),
+            };
+            match crate::folders::save(&cfg.data_file, &cat) {
                 Ok(()) => Resp::json(200, &serde_json::json!({ "saved": cfg.data_file.display().to_string() })),
-                Err(e) => Resp::text(500, &format!("could not write {}: {e}", cfg.data_file.display())),
+                Err(e) => Resp::text(500, &format!("could not write {e}")),
+            }
+        }
+        // A collection folder for the browser app: {"path", "link": bool}.
+        ("POST", "folder") => {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let path = std::path::PathBuf::from(body["path"].as_str().unwrap_or_default());
+            if body["link"].as_bool().unwrap_or(false) {
+                return match crate::folders::can_link(&path) {
+                    Ok(()) => Resp::json(200, &serde_json::json!({ "collection": apicraft_core::model::Collection::new(""), "workflows": [], "warnings": [] })),
+                    Err(e) => Resp::text(400, &e),
+                };
+            }
+            match crate::folders::read_collection(&path) {
+                Ok((collection, workflows, warnings)) => {
+                    Resp::json(200, &serde_json::json!({ "collection": collection, "workflows": workflows, "warnings": warnings }))
+                }
+                Err(e) => Resp::text(400, &e),
             }
         }
         _ => Resp::text(404, "unknown agent endpoint"),

@@ -3,6 +3,8 @@
 //! HTTP/2, the local web server/proxy for the browser build, and the default
 //! catalog location.
 
+pub mod connect;
+pub mod folders;
 pub mod mcp_client;
 pub mod mcp_server;
 pub mod server;

@@ -2,6 +2,7 @@
 
 use apicraft_core::codegen::{self, Target};
 use apicraft_core::format::human_size;
+use apicraft_core::model::ProxyMode;
 use egui::{Align, Layout, RichText, TextEdit, Ui};
 
 use super::response;
@@ -344,6 +345,20 @@ fn confirm(app: &mut ApiCraftApp, ui: &mut Ui, message: &str) {
 
 fn settings(app: &mut ApiCraftApp, ui: &mut Ui) {
     head(app, ui, "Settings");
+    let tab_id = egui::Id::unique("settings-tab");
+    let mut network = ui.ctx().data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
+    widgets::segmented(ui, &mut network, &[(false, "General"), (true, "Network")]);
+    ui.ctx().data_mut(|d| d.insert_temp(tab_id, network));
+    ui.add_space(8.0);
+    if network {
+        network_settings(app, ui);
+        foot(ui, |ui| {
+            if accent_button(ui, "Done").clicked() {
+                app.modal = None;
+            }
+        });
+        return;
+    }
     let p = pal(ui);
     let st = app.platform.status();
     alert(ui, if st.level == crate::platform::Level::Warn { AlertKind::Warn } else { AlertKind::Ok }, &st.detail);
@@ -388,6 +403,76 @@ fn settings(app: &mut ApiCraftApp, ui: &mut Ui) {
             app.modal = None;
         }
     });
+}
+
+/// Proxy and TLS settings (kept in the catalog, so the CLI uses them too).
+fn network_settings(app: &mut ApiCraftApp, ui: &mut Ui) {
+    let p = pal(ui);
+    let honoured = app.platform.native_grpc();
+    let n = &mut app.catalog.network;
+    if !honoured {
+        alert(
+            ui,
+            AlertKind::Warn,
+            "The browser uses its own proxy and certificate settings. These apply when requests go through the local agent, and in the desktop app and CLI.",
+        );
+        ui.add_space(6.0);
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Proxy").strong());
+        widgets::segmented(ui, &mut n.proxy, &[(ProxyMode::System, "System"), (ProxyMode::None, "None"), (ProxyMode::Manual, "Manual")]);
+    });
+    match n.proxy {
+        ProxyMode::System => help(ui, "Uses the HTTPS_PROXY, HTTP_PROXY, ALL_PROXY and NO_PROXY environment variables, when set."),
+        ProxyMode::None => help(ui, "Connects directly, ignoring any proxy environment variables."),
+        ProxyMode::Manual => {
+            ui.add_space(4.0);
+            egui::Grid::new("proxy-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Proxy URL");
+                ui.add(TextEdit::singleline(&mut n.proxy_url).hint_text("http://proxy.corp:8080   or   socks5://127.0.0.1:1080").desired_width(360.0));
+                ui.end_row();
+                ui.label("Username");
+                ui.add(TextEdit::singleline(&mut n.proxy_username).hint_text("optional").desired_width(360.0));
+                ui.end_row();
+                ui.label("Password");
+                ui.add(TextEdit::singleline(&mut n.proxy_password).password(true).desired_width(360.0));
+                ui.end_row();
+            });
+        }
+    }
+    if n.proxy != ProxyMode::None {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Bypass for");
+            ui.add(TextEdit::singleline(&mut n.no_proxy).hint_text("localhost, 127.0.0.1, .internal.example.com").desired_width(360.0));
+        });
+    }
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(RichText::new("Certificates").strong());
+    ui.checkbox(&mut n.verify_tls, "Verify server certificates");
+    if !n.verify_tls {
+        alert(ui, AlertKind::Warn, "Any certificate is accepted, so connections can be intercepted. Use this only for local and test servers.");
+    }
+    ui.add_space(6.0);
+    ui.label("Trusted CA certificates");
+    ui.add(
+        TextEdit::multiline(&mut n.ca_certificates)
+            .hint_text("PEM text (-----BEGIN CERTIFICATE-----\u{2026}), or the path of a .pem / .crt file")
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    help(ui, "When set, servers are checked against these certificates instead of the built-in roots: for a company CA, or a test server's own certificate.");
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(format!(
+            "{}  Client certificates (mutual TLS) are set in a request's or collection's Auth tab. {{{{variables}}}} work in these fields.",
+            icons::SHIELD_CHECK
+        ))
+        .size(12.0)
+        .color(p.muted),
+    );
 }
 
 fn step_result(app: &mut ApiCraftApp, ui: &mut Ui, index: usize) {

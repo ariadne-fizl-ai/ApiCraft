@@ -1,7 +1,7 @@
 //! The workflow editor and its run results.
 
 use apicraft_core::codegen::Target;
-use apicraft_core::model::{Protocol, WorkflowStep};
+use apicraft_core::model::{ForEach, Protocol, WorkflowStep};
 use egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, Stroke, TextEdit, Ui};
 
 use super::topbar;
@@ -107,7 +107,13 @@ fn steps(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
     let p = pal(ui);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Steps").strong());
-        ui.label(RichText::new("run top to bottom; values captured by one step are available to the next as {{name}}").size(12.0).color(p.muted));
+        ui.label(
+            RichText::new(
+                "run top to bottom; values captured by one step are available to the next as {{name}}. A step can repeat for each item of a captured list.",
+            )
+            .size(12.0)
+            .color(p.muted),
+        );
     });
     ui.add_space(6.0);
 
@@ -156,76 +162,114 @@ fn steps(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
         help(ui, "No steps yet. Add saved requests below, in the order they should run.");
     }
     let n = w.steps.len();
+    // Which loop (by its first step) covers each step; loops don't nest.
+    let mut covered: Vec<Option<usize>> = vec![None; n];
+    let mut i = 0;
+    while i < n {
+        match w.steps[i].for_each.as_ref().filter(|_| w.steps[i].enabled) {
+            Some(fe) => {
+                let end = (i + fe.steps.max(1) as usize).min(n);
+                covered[i..end].iter_mut().for_each(|c| *c = Some(i));
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
     let mut op: Option<(usize, i32)> = None; // (index, -1 up / +1 down / 0 delete)
     for (i, s) in w.steps.iter_mut().enumerate() {
         let open = expanded.contains(&s.id);
-        Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(10, 6)).fill(p.surface).show(
-            ui,
-            |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let (fill, color, mark) = match last_state.get(i).copied().flatten() {
-                        Some(true) => (p.ok_bg, p.ok_text, icons::CHECK.to_string()),
-                        Some(false) => (p.err_bg, p.err_text, icons::X.to_string()),
-                        None => (p.surface3, p.muted, (i + 1).to_string()),
-                    };
-                    pill(ui, mark, fill, color);
-                    ui.checkbox(&mut s.enabled, "").on_hover_text("Enabled");
-                    match info.get(i).cloned().flatten() {
-                        Some(StepInfo { protocol: proto, method, name, url, captures: caps, checks }) => {
-                            ui.label(RichText::new(method_label(proto, &method)).monospace().strong().size(11.0).color(method_color(p, proto, &method)));
-                            if ui.link(RichText::new(&name).strong()).clicked() {
-                                actions.push(Action::Open(s.request_id.clone()));
-                            }
-                            // Leave room for the controls on the right, or the URL runs under them.
-                            let room = (ui.available_width() - 240.0).max(40.0);
-                            ui.scope(|ui| {
-                                ui.set_max_width(room);
-                                ui.add(egui::Label::new(RichText::new(url).monospace().size(11.5).color(p.muted)).truncate());
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if widgets::icon_button(ui, icons::TRASH, "Remove step").clicked() {
-                                    op = Some((i, 0));
-                                }
-                                if ui.add_enabled(i + 1 < n, egui::Button::new(icons::ARROW_DOWN).frame(false)).on_hover_text("Move down").clicked() {
-                                    op = Some((i, 1));
-                                }
-                                if ui.add_enabled(i > 0, egui::Button::new(icons::ARROW_UP).frame(false)).on_hover_text("Move up").clicked() {
-                                    op = Some((i, -1));
-                                }
-                                if widgets::icon_button(ui, if open { icons::CARET_DOWN } else { icons::CARET_RIGHT }, "Step captures and checks").clicked() {
-                                    if open {
-                                        expanded.remove(&s.id);
-                                    } else {
-                                        expanded.insert(s.id.clone());
-                                    }
-                                }
-                                ui.label(RichText::new("ms").size(12.0).color(p.muted));
-                                ui.add(egui::DragValue::new(&mut s.delay_ms).range(0..=600_000).speed(50));
-                                ui.label(RichText::new("wait").size(12.0).color(p.muted));
-                                ui.label(RichText::new(format!("{} {}", icons::CHECK, checks + s.checks.len())).size(12.0).color(p.muted))
-                                    .on_hover_text("checks");
-                                ui.label(RichText::new(format!("{} {}", icons::VARIABLE, caps + s.extract.len())).size(12.0).color(p.muted))
-                                    .on_hover_text("captures");
-                            });
+        let in_loop = covered[i].is_some();
+        if let (Some(start), Some(fe)) = (covered[i].filter(|c| *c == i), s.for_each.as_ref()) {
+            let end = (start + fe.steps.max(1) as usize).min(n);
+            let item = if fe.item.trim().is_empty() { "item" } else { fe.item.trim() };
+            let path = if fe.path.trim().is_empty() { String::new() } else { format!(" at {}", fe.path.trim()) };
+            let range = if end - start == 1 { format!("step {}", start + 1) } else { format!("steps {}\u{2013}{end}", start + 1) };
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(match fe.list.trim().trim_matches(['{', '}']) {
+                        "" => format!("{}  For each {{{{{item}}}}} in a list (choose it below)", icons::REPEAT),
+                        list => format!("{}  For each {{{{{item}}}}} in {{{{{list}}}}}{path}", icons::REPEAT),
+                    })
+                    .strong()
+                    .color(p.accent),
+                );
+                ui.label(RichText::new(format!("repeats {range}; {{{{{item}.field}}}} and {{{{$index}}}} work in them")).size(12.0).color(p.muted));
+            });
+        }
+        let frame = Frame::new()
+            .stroke(Stroke::new(1.0, if in_loop { p.accent.gamma_multiply(0.55) } else { p.border }))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(10, 6))
+            .outer_margin(Margin { left: if in_loop { 18 } else { 0 }, ..Margin::ZERO })
+            .fill(p.surface);
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (fill, color, mark) = match last_state.get(i).copied().flatten() {
+                    Some(true) => (p.ok_bg, p.ok_text, icons::CHECK.to_string()),
+                    Some(false) => (p.err_bg, p.err_text, icons::X.to_string()),
+                    None => (p.surface3, p.muted, (i + 1).to_string()),
+                };
+                pill(ui, mark, fill, color);
+                ui.checkbox(&mut s.enabled, "").on_hover_text("Enabled");
+                match info.get(i).cloned().flatten() {
+                    Some(StepInfo { protocol: proto, method, name, url, captures: caps, checks }) => {
+                        ui.label(RichText::new(method_label(proto, &method)).monospace().strong().size(11.0).color(method_color(p, proto, &method)));
+                        if ui.link(RichText::new(&name).strong()).clicked() {
+                            actions.push(Action::Open(s.request_id.clone()));
                         }
-                        None => {
-                            ui.label(RichText::new("Deleted request").color(p.danger));
+                        // Leave room for the controls on the right, or the URL runs under them.
+                        let room = (ui.available_width() - 240.0).max(40.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(room);
+                            ui.add(egui::Label::new(RichText::new(url).monospace().size(11.5).color(p.muted)).truncate());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if widgets::icon_button(ui, icons::TRASH, "Remove step").clicked() {
                                 op = Some((i, 0));
                             }
+                            if ui.add_enabled(i + 1 < n, egui::Button::new(icons::ARROW_DOWN).frame(false)).on_hover_text("Move down").clicked() {
+                                op = Some((i, 1));
+                            }
+                            if ui.add_enabled(i > 0, egui::Button::new(icons::ARROW_UP).frame(false)).on_hover_text("Move up").clicked() {
+                                op = Some((i, -1));
+                            }
+                            if widgets::icon_button(ui, if open { icons::CARET_DOWN } else { icons::CARET_RIGHT }, "Loop, captures and checks for this step")
+                                .clicked()
+                            {
+                                if open {
+                                    expanded.remove(&s.id);
+                                } else {
+                                    expanded.insert(s.id.clone());
+                                }
+                            }
+                            ui.label(RichText::new("ms").size(12.0).color(p.muted));
+                            ui.add(egui::DragValue::new(&mut s.delay_ms).range(0..=600_000).speed(50));
+                            ui.label(RichText::new("wait").size(12.0).color(p.muted));
+                            ui.label(RichText::new(format!("{} {}", icons::CHECK, checks + s.checks.len())).size(12.0).color(p.muted)).on_hover_text("checks");
+                            ui.label(RichText::new(format!("{} {}", icons::VARIABLE, caps + s.extract.len())).size(12.0).color(p.muted))
+                                .on_hover_text("captures");
+                        });
+                    }
+                    None => {
+                        ui.label(RichText::new("Deleted request").color(p.danger));
+                        if widgets::icon_button(ui, icons::TRASH, "Remove step").clicked() {
+                            op = Some((i, 0));
                         }
                     }
-                });
-                if open {
-                    ui.separator();
-                    help(ui, "Extra captures and checks for this step only, on top of the request's own.");
-                    widgets::capture_table(ui, &format!("step-cap-{}", s.id), &mut s.extract, None, apicraft_core::model::ExtractSource::Json);
-                    ui.add_space(8.0);
-                    widgets::checks_table(ui, &format!("step-chk-{}", s.id), &mut s.checks);
                 }
-            },
-        );
+            });
+            if open {
+                ui.separator();
+                loop_editor(ui, s, n - i);
+                ui.add_space(6.0);
+                help(ui, "Extra captures and checks for this step only, on top of the request's own.");
+                widgets::capture_table(ui, &format!("step-cap-{}", s.id), &mut s.extract, None, apicraft_core::model::ExtractSource::Json);
+                ui.add_space(8.0);
+                widgets::checks_table(ui, &format!("step-chk-{}", s.id), &mut s.checks);
+            }
+        });
         ui.add_space(4.0);
     }
     if let Some((i, d)) = op {
@@ -258,6 +302,44 @@ fn steps(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
         ui.label(RichText::new("starting values; environment and captured values override them").size(12.0).color(p.muted));
     });
     kv_table(ui, "wfvars", &mut w.variables, "name", "value");
+}
+
+/// "Repeat this step for each item of a list".
+fn loop_editor(ui: &mut Ui, s: &mut WorkflowStep, remaining: usize) {
+    let p = pal(ui);
+    let mut on = s.for_each.is_some();
+    if ui.checkbox(&mut on, RichText::new("Repeat for each item of a list").strong()).changed() {
+        s.for_each = on.then(ForEach::default);
+    }
+    let Some(fe) = s.for_each.as_mut() else { return };
+    egui::Grid::new(("loop", &s.id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        ui.label("List");
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut fe.list).hint_text("people   (a variable captured earlier)").desired_width(200.0).font(egui::TextStyle::Monospace),
+            );
+            ui.label(RichText::new("at").color(p.muted));
+            ui.add(
+                TextEdit::singleline(&mut fe.path).hint_text("$.value   or   $.items[*].id   (optional)").desired_width(230.0).font(egui::TextStyle::Monospace),
+            );
+        });
+        ui.end_row();
+        ui.label("Each item as");
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(&mut fe.item).hint_text("item").desired_width(120.0).font(egui::TextStyle::Monospace));
+            ui.label(RichText::new("Steps to repeat").color(p.muted));
+            ui.add(egui::DragValue::new(&mut fe.steps).range(1..=remaining.max(1) as u32));
+            ui.label(RichText::new("(this one and the ones after it)").size(12.0).color(p.muted));
+        });
+        ui.end_row();
+    });
+    let item = if fe.item.trim().is_empty() { "item" } else { fe.item.trim() };
+    help(
+        ui,
+        &format!(
+            "The list is a JSON array (or lines or comma-separated text). Use {{{{{item}}}}} for the item, {{{{{item}.id}}}} for its fields and {{{{$index}}}} for its position (from 0)."
+        ),
+    );
 }
 
 fn results(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
@@ -311,6 +393,9 @@ fn results(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
                         let name =
                             if multi { format!("#{} {}. {}", rep.iteration, rep.index + 1, rep.name) } else { format!("{}. {}", rep.index + 1, rep.name) };
                         ui.label(RichText::new(name).strong());
+                        if let Some(it) = &rep.item {
+                            widgets::chip(ui, format!("{} {}/{}  {}", icons::REPEAT, it.index + 1, it.count, it.label));
+                        }
                         match (&rep.outcome, &rep.skipped) {
                             (Some(o), _) => {
                                 if let Some(r) = &o.response {

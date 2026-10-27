@@ -14,7 +14,7 @@ use crate::app::{ApiCraftApp, Modal, ThemeChoice, View};
 use crate::icons;
 use crate::platform::Level;
 use crate::theme::{pal, RADIUS};
-use widgets::{accent_button, chip, pill};
+use widgets::accent_button;
 
 pub fn frame(app: &mut ApiCraftApp, ui: &mut Ui) {
     let p = pal(ui);
@@ -54,20 +54,18 @@ pub(crate) fn topbar(app: &mut ApiCraftApp, ui: &mut Ui, title: impl FnOnce(&mut
                 }
                 // how requests are sent
                 let st = app.platform.status();
-                let (fill, color) = match st.level {
-                    Level::Good => (p.ok_bg, p.ok_text),
-                    Level::Warn => (p.warn_bg, p.warn_text),
-                    Level::Neutral => (p.surface3, p.muted),
+                let dot = match st.level {
+                    Level::Good => p.ok_text,
+                    Level::Warn => p.warn_text,
+                    Level::Neutral => p.faint,
                 };
-                if pill(ui, st.label, fill, color).interact(egui::Sense::click()).on_hover_text(st.detail).clicked() {
+                if widgets::status_button(ui, dot, &st.label).on_hover_text(format!("{}\n\nClick for settings.", st.detail)).clicked() {
                     app.modal = Some(Modal::Settings);
                 }
                 // captured values
                 let n = app.catalog.runtime.len();
-                let label = format!("{} Variables {n}", icons::VARIABLE);
-                let r = if n > 0 { pill(ui, label, p.accent_soft, p.accent) } else { chip(ui, label) };
                 let tip = "Variables captured from responses while sending requests and running workflows. Click to view, edit or clear them.";
-                if r.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                if widgets::count_button(ui, icons::VARIABLE, "Variables", n).on_hover_text(tip).clicked() {
                     app.modal = Some(Modal::Runtime);
                 }
                 if widgets::icon_button(ui, icons::GEAR, "Manage environments").clicked() {

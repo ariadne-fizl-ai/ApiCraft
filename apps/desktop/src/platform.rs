@@ -9,10 +9,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use apicraft_agent::{default_catalog_path, server::write_atomic, NativeTransport};
+use apicraft_agent::{default_catalog_path, folders, server::write_atomic, NativeTransport};
 use apicraft_core::model::Catalog;
 use apicraft_core::store;
-use apicraft_ui::{run_job, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
+use apicraft_ui::{run_job, FolderContents, FolderPurpose, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
 
 const DEFAULT_REDIRECT: &str = "http://127.0.0.1:7878/callback";
 
@@ -23,6 +23,8 @@ pub struct DesktopPlatform {
     last_poll: Mutex<Instant>,
     /// A problem found while loading, reported once the UI is up.
     startup_note: Mutex<Option<String>>,
+    /// The state of linked collection folders as we last read or wrote them.
+    known_folders: Mutex<u64>,
 }
 
 impl DesktopPlatform {
@@ -32,6 +34,7 @@ impl DesktopPlatform {
             known_mtime: Mutex::new(None),
             last_poll: Mutex::new(Instant::now()),
             startup_note: Mutex::new(None),
+            known_folders: Mutex::new(0),
         }
     }
 }
@@ -42,6 +45,26 @@ impl DesktopPlatform {
         if let Ok(mut k) = self.known_mtime.lock() {
             *k = m;
         }
+    }
+
+    fn remember_folders(&self, catalog: &Catalog) {
+        if let Ok(mut k) = self.known_folders.lock() {
+            *k = folders::fingerprint(catalog);
+        }
+    }
+
+    /// The catalog file with its linked folders read in.
+    fn read_catalog(&self) -> Result<Catalog, String> {
+        let bytes = std::fs::read(&self.catalog_path).map_err(|e| e.to_string())?;
+        let mut catalog = store::decode(&bytes)?.into_catalog();
+        let warnings = folders::expand(&mut catalog);
+        if !warnings.is_empty() {
+            if let Ok(mut n) = self.startup_note.lock() {
+                *n = Some(warnings.join("\n"));
+            }
+        }
+        self.remember_folders(&catalog);
+        Ok(catalog)
     }
 }
 
@@ -79,10 +102,12 @@ impl Platform for DesktopPlatform {
     }
 
     fn load_catalog(&self) -> Option<Catalog> {
-        let bytes = std::fs::read(&self.catalog_path).ok()?;
+        if !self.catalog_path.exists() {
+            return None;
+        }
         self.remember_mtime();
-        match store::decode(&bytes) {
-            Ok(imported) => Some(imported.into_catalog()),
+        match self.read_catalog() {
+            Ok(catalog) => Some(catalog),
             Err(e) => {
                 // Keep the unreadable file rather than overwrite it.
                 let backup = self.catalog_path.with_extension(format!("unreadable-{}.gz", apicraft_agent::now_ms()));
@@ -96,8 +121,10 @@ impl Platform for DesktopPlatform {
     }
 
     fn save_catalog(&self, catalog: &Catalog) -> Result<(), String> {
-        write_atomic(&self.catalog_path, &store::to_gzip(catalog)).map_err(|e| format!("{}: {e}", self.catalog_path.display()))?;
+        let stub = folders::write_linked(catalog)?;
+        write_atomic(&self.catalog_path, &store::to_gzip(&stub)).map_err(|e| format!("{}: {e}", self.catalog_path.display()))?;
         self.remember_mtime();
+        self.remember_folders(catalog);
         Ok(())
     }
 
@@ -111,11 +138,16 @@ impl Platform for DesktopPlatform {
         }
         let mtime = std::fs::metadata(&self.catalog_path).and_then(|m| m.modified()).ok()?;
         let known = *self.known_mtime.lock().ok()?;
-        if known == Some(mtime) {
+        // Linked folders count too: an editor or `git pull` may change them.
+        let folders_changed = {
+            let bytes = std::fs::read(&self.catalog_path).ok()?;
+            let stub = store::decode(&bytes).ok()?.into_catalog();
+            folders::fingerprint(&stub) != *self.known_folders.lock().ok()?
+        };
+        if known == Some(mtime) && !folders_changed {
             return None;
         }
-        let bytes = std::fs::read(&self.catalog_path).ok()?;
-        let catalog = store::decode(&bytes).ok()?.into_catalog();
+        let catalog = self.read_catalog().ok()?;
         *self.known_mtime.lock().ok()? = Some(mtime);
         Some(catalog)
     }
@@ -130,6 +162,29 @@ impl Platform for DesktopPlatform {
             Ok(()) => inbox.toast(format!("Saved {}", path.display()), false),
             Err(e) => inbox.toast(format!("Could not save {}: {e}", path.display()), true),
         }
+    }
+
+    fn pick_folder(&self, purpose: FolderPurpose, inbox: Inbox) {
+        let title = match purpose {
+            FolderPurpose::Link(_) => "Choose an empty folder for the collection's files",
+            _ => "Open a collection folder",
+        };
+        if let Some(path) = rfd::FileDialog::new().set_title(title).pick_folder() {
+            inbox.post(Msg::FolderPicked { path: path.display().to_string(), purpose });
+        }
+    }
+
+    fn load_folder(&self, path: String, purpose: FolderPurpose, inbox: Inbox) {
+        let dir = PathBuf::from(&path);
+        let result = match &purpose {
+            FolderPurpose::Link(_) => folders::can_link(&dir).map(|()| FolderContents {
+                collection: apicraft_core::model::Collection::new(""),
+                workflows: Vec::new(),
+                warnings: Vec::new(),
+            }),
+            _ => folders::read_collection(&dir).map(|(collection, workflows, warnings)| FolderContents { collection, workflows, warnings }),
+        };
+        inbox.post(Msg::FolderLoaded { path, purpose, result: result.map(Box::new) });
     }
 
     fn open_files(&self, inbox: Inbox) {

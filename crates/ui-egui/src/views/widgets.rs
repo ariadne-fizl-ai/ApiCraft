@@ -25,6 +25,30 @@ pub fn danger_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
 }
 
 /// A small icon-only button with a tooltip.
+/// A standard button with a count after its label, highlighted when non-zero.
+pub fn count_button(ui: &mut Ui, icon: &str, label: &str, count: usize) -> egui::Response {
+    let p = pal(ui);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    let fmt = |color| egui::text::TextFormat { font_id: font.clone(), color, ..Default::default() };
+    job.append(&format!("{icon}  {label}"), 0.0, fmt(p.text));
+    job.append(&count.to_string(), 8.0, fmt(if count > 0 { p.accent } else { p.faint }));
+    ui.add(egui::Button::new(job))
+}
+
+/// A standard button led by a small status dot.
+pub fn status_button(ui: &mut Ui, dot: Color32, label: &str) -> egui::Response {
+    let p = pal(ui);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    // Room for the dot, painted over the button below.
+    job.append(label, 14.0, egui::text::TextFormat { font_id: font, color: p.text, ..Default::default() });
+    let resp = ui.add(egui::Button::new(job));
+    let pad = ui.spacing().button_padding.x;
+    ui.painter().circle_filled(egui::pos2(resp.rect.left() + pad + 4.0, resp.rect.center().y), 4.0, dot);
+    resp
+}
+
 pub fn icon_button(ui: &mut Ui, icon: &str, tip: &str) -> egui::Response {
     let p = pal(ui);
     ui.add(egui::Button::new(RichText::new(icon).color(p.muted)).frame(false)).on_hover_text(tip)
@@ -401,6 +425,14 @@ pub fn auth_editor(ui: &mut Ui, auth: &mut Auth, cx: &AuthCtx, actions: &mut Vec
             field_multiline(ui, "Payload (JSON claims)", &mut j.payload, 4);
             field(ui, "Header prefix", &mut j.header_prefix, false, "Bearer");
             help(ui, "iat/exp are added when missing and an expiry is set.");
+        }
+        Auth::ClientCert(c) => {
+            field_multiline(ui, "Certificate (PEM text, or the path of a .pem/.crt file)", &mut c.certificate, 3);
+            field_multiline(ui, "Private key (PEM text, or the path of a .key/.pem file)", &mut c.key, 3);
+            help(ui, "Sent during the TLS handshake (mutual TLS). The key must be unencrypted (PKCS#8, PKCS#1 or SEC1). Paths are read when the request is sent, so the key needn't live in the catalog.");
+            if !cx.native {
+                alert(ui, AlertKind::Warn, "Browsers can't present client certificates; these requests need the desktop app or the local agent.");
+            }
         }
     }
 }

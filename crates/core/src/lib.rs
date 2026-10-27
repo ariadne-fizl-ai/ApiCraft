@@ -10,6 +10,7 @@ pub mod codegen;
 pub mod curl_import;
 pub mod engine;
 pub mod extract;
+pub mod folder;
 pub mod format;
 pub mod graphql;
 pub mod grpc;

@@ -9,7 +9,7 @@
 
 use super::{curl_parts, generate_with, ps, ps_request, request_plan, sh, Target};
 use crate::extract::{describe, path_segments, Seg};
-use crate::model::{Catalog, Check, CheckKind, ExtractSource, Extraction, KeyValue, Protocol};
+use crate::model::{Catalog, Check, CheckKind, ExtractSource, Extraction, ForEach, KeyValue, Protocol};
 use crate::vars::Vars;
 
 const OPEN: char = '\u{1}';
@@ -40,12 +40,75 @@ impl Step {
     }
 }
 
+/// A run of steps, or steps repeated over a list.
+enum Block {
+    Step(Step),
+    Loop { fe: ForEach, first: usize, last: usize, body: Vec<Step> },
+}
+
+/// The `{{names}}` a request uses (its fields and its effective auth).
+fn referenced_names(catalog: &Catalog, request_id: &str) -> Vec<String> {
+    let mut text = catalog.find_request(request_id).and_then(|(_, r)| serde_json::to_string(r).ok()).unwrap_or_default();
+    if let Some((auth, _)) = catalog.effective_auth(request_id) {
+        text.push_str(&serde_json::to_string(&auth).unwrap_or_default());
+    }
+    let mut out = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let name = after[..end].trim().to_string();
+        if !out.contains(&name) {
+            out.push(name);
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+fn loop_item_name(fe: &ForEach) -> String {
+    if fe.item.trim().is_empty() {
+        "item".into()
+    } else {
+        fe.item.trim().to_string()
+    }
+}
+
+fn is_loop_var(name: &str, item: &str) -> bool {
+    name == item || name.starts_with(&format!("{item}.")) || name == "$index" || name == "$count"
+}
+
+/// The list's JSON path split at its `[*]`, as segment arrays (head, tail).
+fn loop_paths(path: &str) -> (Vec<Seg>, Vec<Seg>) {
+    let path = path.trim();
+    let (head, tail) = match path.find("[*]").map(|i| (i, 3)).or_else(|| path.find(".*").map(|i| (i, 2))) {
+        Some((i, len)) => (&path[..i], &path[i + len..]),
+        None => (path, ""),
+    };
+    let segs = |p: &str| if p.is_empty() || p == "$" { Vec::new() } else { path_segments(p).unwrap_or_default() };
+    (segs(head), segs(&format!("${tail}")))
+}
+
+fn seg_values(segs: &[Seg]) -> Vec<serde_json::Value> {
+    segs.iter()
+        .map(|s| match s {
+            Seg::Key(k) => k.as_str().into(),
+            Seg::Index(i) => (*i).into(),
+        })
+        .collect()
+}
+
+/// The path inside an item that a loop variable names: `person.a.0` → `["a", "0"]`.
+fn item_field_path(name: &str, item: &str) -> Vec<serde_json::Value> {
+    name.strip_prefix(item).unwrap_or_default().split('.').filter(|s| !s.is_empty()).map(|s| s.into()).collect()
+}
+
 pub fn generate_workflow(catalog: &Catalog, workflow_id: &str, now_ms: u64, target: Target) -> Result<String, String> {
     let wf = catalog.workflow(workflow_id).ok_or("workflow not found")?;
-    let mut steps = Vec::new();
-    for (i, s) in wf.steps.iter().enumerate().filter(|(_, s)| s.enabled) {
-        let Some((_, req)) = catalog.find_request(&s.request_id) else { continue };
-        steps.push(Step {
+    let make_step = |i: usize| -> Option<Step> {
+        let s = &wf.steps[i];
+        let (_, req) = catalog.find_request(&s.request_id).filter(|_| s.enabled)?;
+        Some(Step {
             number: i + 1,
             name: req.name.clone(),
             request_id: s.request_id.clone(),
@@ -53,8 +116,31 @@ pub fn generate_workflow(catalog: &Catalog, workflow_id: &str, now_ms: u64, targ
             delay_ms: s.delay_ms,
             extract: req.extract.iter().chain(&s.extract).filter(|e| e.enabled && !e.variable.trim().is_empty()).cloned().collect(),
             checks: req.checks.iter().chain(&s.checks).filter(|c| c.enabled).cloned().collect(),
-        });
+        })
+    };
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < wf.steps.len() {
+        match wf.steps[i].for_each.clone().filter(|_| wf.steps[i].enabled) {
+            Some(fe) => {
+                let end = (i + fe.steps.max(1) as usize).min(wf.steps.len());
+                let body: Vec<Step> = (i..end).filter_map(make_step).collect();
+                blocks.push(Block::Loop { fe, first: i + 1, last: end, body });
+                i = end;
+            }
+            None => {
+                blocks.extend(make_step(i).map(Block::Step));
+                i += 1;
+            }
+        }
     }
+    let steps: Vec<&Step> = blocks
+        .iter()
+        .flat_map(|b| match b {
+            Block::Step(s) => vec![s],
+            Block::Loop { body, .. } => body.iter().collect(),
+        })
+        .collect();
     if steps.is_empty() {
         return Err("the workflow has no enabled steps".into());
     }
@@ -82,14 +168,48 @@ pub fn generate_workflow(catalog: &Catalog, workflow_id: &str, now_ms: u64, targ
     let first = vars_for(&steps[0].request_id, false);
     let initial: Vec<(String, String)> = captured.iter().map(|n| (n.clone(), first.get(n).unwrap_or_default())).collect();
 
+    let step_code = |step: &Step, loop_vars: &[String]| -> Result<String, String> {
+        let mut vars = vars_for(&step.request_id, true);
+        for name in loop_vars {
+            vars.set(name, &marker(name));
+        }
+        match target {
+            Target::Curl => bash_step(catalog, step, &vars, now_ms),
+            Target::PowerShell => ps_step(catalog, step, &vars, now_ms),
+        }
+    };
     let mut body = Vec::new();
-    for step in &steps {
-        let vars = vars_for(&step.request_id, true);
-        let code = match target {
-            Target::Curl => bash_step(catalog, step, &vars, now_ms)?,
-            Target::PowerShell => ps_step(catalog, step, &vars, now_ms)?,
-        };
-        body.push(code);
+    for block in &blocks {
+        match block {
+            Block::Step(step) => body.push(step_code(step, &[])?),
+            Block::Loop { fe, first, last, body: steps } => {
+                let item = loop_item_name(fe);
+                let mut loop_vars: Vec<String> = Vec::new();
+                for s in steps {
+                    for n in referenced_names(catalog, &s.request_id) {
+                        if is_loop_var(&n, &item) && !loop_vars.contains(&n) {
+                            loop_vars.push(n);
+                        }
+                    }
+                    for n in s.checks.iter().flat_map(|c| [c.target.clone(), c.expected.clone()]) {
+                        for m in [item.clone(), "$index".into(), "$count".into()] {
+                            if n.contains(&format!("{{{{{m}")) && !loop_vars.contains(&m) {
+                                loop_vars.push(m);
+                            }
+                        }
+                    }
+                }
+                let list = fe.list.trim().trim_start_matches("{{").trim_end_matches("}}").trim().to_string();
+                // A captured list comes from the script's variables; anything else is fixed now.
+                let source = if captured.contains(&list) { None } else { Some(first_vars_value(&vars_for, steps, &list)) };
+                let code: Vec<String> = steps.iter().map(|s| step_code(s, &loop_vars)).collect::<Result<_, _>>()?;
+                let range = if first == last { format!("step {first}") } else { format!("steps {first}-{last}") };
+                body.push(match target {
+                    Target::Curl => bash_loop(fe, &item, &list, source.as_deref(), &loop_vars, &range, &code),
+                    Target::PowerShell => ps_loop(fe, &item, &list, source.as_deref(), &loop_vars, &range, &code),
+                });
+            }
+        }
     }
     let iterations = wf.iterations.max(1);
     Ok(match target {
@@ -98,7 +218,39 @@ pub fn generate_workflow(catalog: &Catalog, workflow_id: &str, now_ms: u64, targ
     })
 }
 
+/// A list variable's current value, for loops over lists that aren't captured.
+fn first_vars_value(vars_for: &impl Fn(&str, bool) -> Vars, steps: &[Step], name: &str) -> String {
+    steps.first().map(|s| vars_for(&s.request_id, false).get(name).unwrap_or_default()).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- Bash
+
+fn bash_loop(fe: &ForEach, item: &str, list: &str, fixed: Option<&str>, loop_vars: &[String], range: &str, code: &[String]) -> String {
+    let (head, tail) = loop_paths(&fe.path);
+    let src = match fixed {
+        Some(v) => sh(v),
+        None => format!("\"${}\"", bash_var(list)),
+    };
+    let mut s = format!("# Repeat {range} for each item of {{{{{list}}}}} as {{{{{item}}}}}\n");
+    s.push_str(&format!(
+        "loop_list=$(printf '%s' {src} | items {} {}) || {{ echo '  FAIL the loop list is missing or not a list' >&2; failed=$((failed + 1)); [ \"$stop_on_failure\" -eq 1 ] && finish; }}\nloop_count=$(printf '%s' \"$loop_list\" | grep -c .)\nindex=0\n",
+        sh(&serde_json::Value::Array(seg_values(&head)).to_string()),
+        sh(&serde_json::Value::Array(seg_values(&tail)).to_string())
+    ));
+    s.push_str("while IFS= read -r item_json; do\n  [ -n \"$item_json\" ] || continue\n");
+    s.push_str("  echo \"Item $((index + 1)) of $loop_count\"\n");
+    for name in loop_vars {
+        let value = match name.as_str() {
+            "$index" => "$index".to_string(),
+            "$count" => "$loop_count".to_string(),
+            _ => format!("$(printf '%s' \"$item_json\" | json_in {})", sh(&serde_json::Value::Array(item_field_path(name, item)).to_string())),
+        };
+        s.push_str(&format!("  {}={value}\n", bash_var(name)));
+    }
+    s.push_str(&code.join("\n"));
+    s.push_str("  index=$((index + 1))\ndone <<<\"$loop_list\"\n");
+    s
+}
 
 fn bash_var(name: &str) -> String {
     if name == ITERATION {
@@ -139,9 +291,9 @@ trap 'rm -rf "$tmp"' EXIT
 passed=0
 failed=0
 
-# json '["data", 0, "id"]' prints the value at that path (exit status 1 when there is none).
-json() {
-  P="$1" perl -MJSON::PP -0777 -ne '
+# json '["data", 0, "id"]' prints the value at that path in the last response
+# (exit status 1 when there is none); json_in does the same for its input.
+JSON_PL='
     binmode STDOUT, ":utf8";
     my $c = eval { JSON::PP->new->utf8->allow_nonref->decode($_) };
     exit 1 if $@;
@@ -159,7 +311,41 @@ json() {
     elsif (JSON::PP::is_bool($c)) { print $c ? "true" : "false" }
     elsif (ref $c) { print JSON::PP->new->encode($c) }
     else { print $c }
-  ' "$tmp/body" 2>/dev/null
+'
+json() { P="$1" perl -MJSON::PP -0777 -ne "$JSON_PL" "$tmp/body" 2>/dev/null; }
+json_in() { P="$1" perl -MJSON::PP -0777 -ne "$JSON_PL" 2>/dev/null; }
+# items '["value"]' '["id"]' prints each element of the list on its input as a line of JSON,
+# taking the second path inside each element. Text that isn't JSON is split into lines or at commas.
+items() {
+  H="$1" T="$2" perl -MJSON::PP -0777 -ne '
+    my $j = JSON::PP->new->utf8->allow_nonref->canonical;
+    my @head = @{ $j->decode($ENV{H}) };
+    my @tail = @{ $j->decode($ENV{T}) };
+    my $c = eval { $j->decode($_) };
+    if ($@) {
+      exit 1 if @head;
+      my @parts = /\n/ ? split(/\r?\n/) : split(/,/);
+      for (@parts) { s/^\s+|\s+$//g; print $j->encode($_), "\n" if length }
+      exit 0;
+    }
+    sub walk {
+      my ($c, @p) = @_;
+      for my $s (@p) {
+        if (ref $c eq "HASH") { return undef unless exists $c->{$s}; $c = $c->{$s} }
+        elsif (ref $c eq "ARRAY") { return undef unless $s =~ /^\d+$/ && $s < @$c; $c = $c->[$s] }
+        else { return undef }
+      }
+      return \$c;
+    }
+    my $l = walk($c, @head);
+    exit 1 unless $l;
+    exit 0 unless defined $$l;
+    unless (ref $$l eq "ARRAY") { print STDERR "  FAIL the loop list is not a list\n"; exit 1 }
+    for my $e (@{$$l}) {
+      my $x = @tail ? walk($e, @tail) : \$e;
+      print $j->encode($$x), "\n" if $x;
+    }
+  '
 }
 json_has() { json "$1" >/dev/null; }
 header() { grep -i "^$1:" "$tmp/headers" | tail -n 1 | cut -d: -f2- | sed 's/^ *//' | tr -d '\r'; }
@@ -369,6 +555,43 @@ function Get-JsonValue([string]$Text, [object[]]$Path) {
     return [string]$cur
 }
 
+function Select-JsonSegment($Cur, $Seg) {
+    if ($null -eq $Cur) { return $null }
+    if ($Cur -is [array]) {
+        if ("$Seg" -match '^\d+$' -and [int]"$Seg" -lt $Cur.Count) { return ,$Cur[[int]"$Seg"] }
+        return $null
+    }
+    if ($Cur -is [System.Management.Automation.PSCustomObject]) {
+        $prop = $Cur.PSObject.Properties["$Seg"]
+        if ($null -eq $prop) { return $null }
+        return ,$prop.Value
+    }
+    return $null
+}
+
+# Each element of a list (as compact JSON), taking $Tail inside each one.
+# Text that isn't JSON is split into lines or at commas.
+function Get-JsonItems([string]$Text, [object[]]$Head, [object[]]$Tail) {
+    try { $cur = ConvertFrom-Json -InputObject $Text -NoEnumerate }
+    catch {
+        if ($Head.Count -gt 0) { throw 'the loop list is not JSON' }
+        $parts = if ($Text.Contains("`n")) { $Text -split "`r?`n" } else { $Text -split ',' }
+        return ,@($parts | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { ConvertTo-Json -InputObject $_ -Compress })
+    }
+    foreach ($seg in $Head) { $cur = Select-JsonSegment $cur $seg }
+    if ($null -eq $cur -and $Head.Count -gt 0) { throw 'nothing at the loop list path' }
+    if ($null -eq $cur) { return ,@() }
+    if ($cur -isnot [array]) { throw 'the loop list is not a list' }
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $cur) {
+        $x = $item
+        foreach ($seg in $Tail) { $x = Select-JsonSegment $x $seg }
+        if ($Tail.Count -gt 0 -and $null -eq $x) { continue }
+        $out.Add((ConvertTo-Json -InputObject $x -Compress -Depth 32))
+    }
+    return ,$out.ToArray()
+}
+
 function Get-Header($Response, [string]$Name) {
     if ($null -eq $Response) { return $null }
     $value = $Response.Headers[$Name]
@@ -420,6 +643,46 @@ function Complete-Step {
     if ($stopOnFailure) { Write-Summary; exit 1 }
 }
 "#;
+
+fn ps_loop(fe: &ForEach, item: &str, list: &str, fixed: Option<&str>, loop_vars: &[String], range: &str, code: &[String]) -> String {
+    let (head, tail) = loop_paths(&fe.path);
+    let arr = |segs: &[Seg]| {
+        let parts: Vec<String> = segs
+            .iter()
+            .map(|s| match s {
+                Seg::Key(k) => ps(k),
+                Seg::Index(i) => i.to_string(),
+            })
+            .collect();
+        format!("@({})", parts.join(", "))
+    };
+    let src = match fixed {
+        Some(v) => ps(v),
+        None => format!("$v[{}]", ps(list)),
+    };
+    let mut s = format!("# Repeat {range} for each item of {{{{{list}}}}} as {{{{{item}}}}}\n");
+    s.push_str(&format!(
+        "try {{ $loopItems = Get-JsonItems {src} {} {} }} catch {{\n    Write-Host \"  FAIL $($_.Exception.Message)\" -ForegroundColor Red\n    $failed++\n    if ($stopOnFailure) {{ Write-Summary; exit 1 }}\n    $loopItems = @()\n}}\n",
+        arr(&head),
+        arr(&tail)
+    ));
+    s.push_str("for ($index = 0; $index -lt $loopItems.Count; $index++) {\n    $itemJson = $loopItems[$index]\n");
+    s.push_str("    Write-Host \"Item $($index + 1) of $($loopItems.Count)\"\n");
+    for name in loop_vars {
+        let value = match name.as_str() {
+            "$index" => "\"$index\"".to_string(),
+            "$count" => "\"$($loopItems.Count)\"".to_string(),
+            _ => {
+                let path: Vec<String> = item_field_path(name, item).iter().map(|p| ps(p.as_str().unwrap_or_default())).collect();
+                format!("Get-JsonValue $itemJson @({})", path.join(", "))
+            }
+        };
+        s.push_str(&format!("    $v[{}] = {value}\n", ps(name)));
+    }
+    s.push_str(&code.join("\n"));
+    s.push_str("}\n");
+    s
+}
 
 fn ps_script(name: &str, stop: bool, iterations: u32, initial: &[(String, String)], steps: &[String]) -> String {
     let mut s = format!("# Workflow {}, exported from Fizl ApiCraft.\n", ps(name));
@@ -657,8 +920,15 @@ mod tests {
         me.checks.push(Check { kind: CheckKind::JsonEquals, target: "$.name".into(), expected: "it's {{token}}".into(), enabled: true });
         let mut col = Collection::new("API");
         col.variables.push(KeyValue::new("base", "https://api.example.com"));
-        let step =
-            |r: &Request| WorkflowStep { id: r.id.clone(), request_id: r.id.clone(), enabled: true, delay_ms: 0, extract: Vec::new(), checks: Vec::new() };
+        let step = |r: &Request| WorkflowStep {
+            id: r.id.clone(),
+            request_id: r.id.clone(),
+            enabled: true,
+            delay_ms: 0,
+            extract: Vec::new(),
+            checks: Vec::new(),
+            for_each: None,
+        };
         let wf = Workflow {
             id: "wf".into(),
             name: "Sign in".into(),
@@ -669,6 +939,30 @@ mod tests {
         };
         col.items = vec![Item::Request(login), Item::Request(me)];
         (Catalog { collections: vec![col], workflows: vec![wf], ..Default::default() }, "wf".into())
+    }
+
+    #[test]
+    fn loops_become_script_loops() {
+        let (mut cat, wf) = catalog();
+        let mut item = Request::new("Item", Protocol::Rest);
+        item.url = "{{base}}/items/{{it.id}}?n={{$index}}".into();
+        let mut step = WorkflowStep::new(item.id.clone());
+        step.for_each = Some(ForEach { list: "token".into(), path: "$.list[*].x".into(), item: "it".into(), steps: 1 });
+        cat.collections[0].items.push(Item::Request(item));
+        cat.workflows[0].steps.push(step);
+
+        let s = generate_workflow(&cat, &wf, 0, Target::Curl).unwrap();
+        assert!(!s.contains(OPEN), "{s}");
+        assert!(s.contains("# Repeat step 3 for each item of {{token}} as {{it}}"), "{s}");
+        assert!(s.contains("loop_list=$(printf '%s' \"$v_token\" | items '[\"list\"]' '[\"x\"]')"), "{s}");
+        assert!(s.contains("  v_it_id=$(printf '%s' \"$item_json\" | json_in '[\"id\"]')"), "{s}");
+        assert!(s.contains("--url 'https://api.example.com/items/'\"${v_it_id}\"'?n='\"${v__index}\"''"), "{s}");
+        assert!(s.contains("done <<<\"$loop_list\""), "{s}");
+
+        let s = generate_workflow(&cat, &wf, 0, Target::PowerShell).unwrap();
+        assert!(s.contains("$loopItems = Get-JsonItems $v['token'] @('list') @('x')"), "{s}");
+        assert!(s.contains("    $v['it.id'] = Get-JsonValue $itemJson @('id')"), "{s}");
+        assert!(s.contains("    $v['$index'] = \"$index\""), "{s}");
     }
 
     #[test]

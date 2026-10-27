@@ -32,6 +32,9 @@ impl Transport for WebTransport {
     fn native_grpc(&self) -> bool {
         self.agent.is_some()
     }
+    fn honours_connect_options(&self) -> bool {
+        self.agent.is_some()
+    }
     fn sleep(&self, ms: u32) -> LocalBoxFuture<'_, ()> {
         Box::pin(dom::sleep_ms(ms))
     }
@@ -209,6 +212,23 @@ pub async fn agent_load_catalog(base: &str) -> Result<Option<Vec<u8>>, String> {
         return Err(format!("agent returned {}", resp.status()));
     }
     Ok(Some(response_bytes(&resp).await?))
+}
+
+/// Reads a collection folder through the agent (or, with `link`, checks
+/// one can hold a collection).
+pub async fn agent_folder(base: &str, path: &str, link: bool) -> Result<apicraft_ui::FolderContents, String> {
+    let body = serde_json::json!({ "path": path, "link": link }).to_string();
+    let resp = agent_fetch(&format!("{base}/__apicraft/folder"), "POST", Some(body.as_bytes()), "application/json", None).await?;
+    let bytes = response_bytes(&resp).await?;
+    if !resp.ok() {
+        return Err(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("bad agent reply: {e}"))?;
+    Ok(apicraft_ui::FolderContents {
+        collection: serde_json::from_value(v["collection"].clone()).map_err(|e| format!("bad agent reply: {e}"))?,
+        workflows: serde_json::from_value(v["workflows"].clone()).unwrap_or_default(),
+        warnings: serde_json::from_value(v["warnings"].clone()).unwrap_or_default(),
+    })
 }
 
 pub async fn agent_save_catalog(base: &str, gz: &[u8]) -> Result<(), String> {

@@ -168,6 +168,7 @@ pub async fn http_session(url: &str, headers: &[(String, String)], messages: Vec
             body: serde_json::to_vec(&msg).unwrap_or_default(),
             grpc: false,
             timeout_ms: 60_000,
+            ..Default::default()
         };
         let resp = transport.send(req).await?;
         if let Some(s) = resp.header("mcp-session-id") {

@@ -64,6 +64,10 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
                 acts.push(Action::ImportInto(None));
                 ui.close();
             }
+            if ui.button(format!("{}  Open folder\u{2026}", icons::FOLDER_OPEN)).on_hover_text("A folder with a text file per request and workflow").clicked() {
+                acts.push(Action::OpenFolder);
+                ui.close();
+            }
         });
         let filter = app.filter.trim().to_lowercase();
         if app.catalog.collections.is_empty() {
@@ -74,7 +78,12 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
             if !filter.is_empty() && !c.name.to_lowercase().contains(&filter) && !has_match(&c.items, &filter) {
                 continue;
             }
-            let resp = row(ui, 0, Some(open), None, &c.name, false, &c.id, &mut acts, MenuKind::Collection, Dnd::Into(c.id.clone()));
+            let label = if c.directory.is_some() { format!("{}  {}", c.name, icons::FOLDER_OPEN) } else { c.name.clone() };
+            let resp = row(ui, 0, Some(open), None, &label, false, &c.id, &mut acts, MenuKind::Collection(c.directory.is_some()), Dnd::Into(c.id.clone()));
+            let resp = match &c.directory {
+                Some(dir) => resp.on_hover_text(format!("Saved as files in {dir}")),
+                None => resp,
+            };
             if resp.clicked() {
                 acts.push(Action::Toggle(c.id.clone()));
             }
@@ -223,7 +232,8 @@ struct Badge {
 #[derive(Clone, Copy)]
 enum MenuKind {
     None,
-    Collection,
+    /// `true` when it's kept in a folder of files.
+    Collection(bool),
     Folder,
     Request(Protocol),
     Workflow,
@@ -371,11 +381,17 @@ fn menu(ui: &mut Ui, kind: MenuKind, id: &str, acts: &mut Vec<Action>) {
     };
     let id = id.to_string();
     match kind {
-        MenuKind::Collection => {
+        MenuKind::Collection(linked) => {
             item(ui, &format!("{}  New request", icons::PLUS), Action::NewRequest(Some(id.clone())));
             item(ui, &format!("{}  New folder", icons::FOLDER), Action::NewFolder(id.clone()));
             ui.separator();
             item(ui, &format!("{}  Import into this collection\u{2026}", icons::UPLOAD), Action::ImportInto(Some(id.clone())));
+            if linked {
+                item(ui, &format!("{}  Reload from folder", icons::ARROWS_CLOCKWISE), Action::ReloadFolder(id.clone()));
+                item(ui, &format!("{}  Keep in the catalog instead", icons::FOLDER), Action::UnlinkFolder(id.clone()));
+            } else {
+                item(ui, &format!("{}  Save as a folder of files\u{2026}", icons::FOLDER_OPEN), Action::LinkFolder(id.clone()));
+            }
             ui.separator();
             item(ui, &format!("{}  Variables & auth", icons::GEAR), Action::CollectionSettings(id.clone()));
             item(ui, &format!("{}  Rename", icons::PENCIL), Action::Rename(id.clone()));

@@ -410,6 +410,8 @@ impl ApiCraftApp {
                 }
                 self.schemas.insert(request_id, result);
             }
+            Msg::FolderPicked { path, purpose } => self.platform.load_folder(path, purpose, self.inbox.clone()),
+            Msg::FolderLoaded { path, purpose, result } => actions::folder_loaded(self, &path, purpose, result.map(|c| *c)),
             Msg::ReplaceCatalog { catalog, note } => {
                 self.catalog = *catalog;
                 self.saved_hash = catalog_hash(&self.catalog);

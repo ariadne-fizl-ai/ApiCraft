@@ -8,7 +8,7 @@ use std::rc::Rc;
 use apicraft_core::model::Catalog;
 use apicraft_core::store;
 use apicraft_ui::platform::DroppedFileRef;
-use apicraft_ui::{run_job, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
+use apicraft_ui::{run_job, FolderPurpose, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -171,6 +171,32 @@ impl Platform for WebPlatform {
 
     fn save_file(&self, suggested_name: &str, bytes: Vec<u8>, _inbox: Inbox) {
         dom::download(suggested_name, &bytes);
+    }
+
+    fn pick_folder(&self, purpose: FolderPurpose, inbox: Inbox) {
+        if self.state.agent_base().is_none() || !self.state.mirror.get() {
+            return inbox.toast("Collection folders need the local agent (apicraft-agent), with mirroring to the agent turned on in Settings", true);
+        }
+        let ask = match purpose {
+            FolderPurpose::Link(_) => "Path of an empty folder on this computer for the collection's files (the local agent writes them):",
+            _ => "Path of a collection folder on this computer (the local agent reads it):",
+        };
+        if let Ok(Some(path)) = dom::window().prompt_with_message(ask) {
+            let path = path.trim().trim_matches('"').to_string();
+            if !path.is_empty() {
+                inbox.post(Msg::FolderPicked { path, purpose });
+            }
+        }
+    }
+
+    fn load_folder(&self, path: String, purpose: FolderPurpose, inbox: Inbox) {
+        let Some(base) = self.state.agent_base() else {
+            return inbox.toast("Collection folders need the local agent", true);
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = net::agent_folder(&base, &path, matches!(purpose, FolderPurpose::Link(_))).await;
+            inbox.post(Msg::FolderLoaded { path, purpose, result: result.map(Box::new) });
+        });
     }
 
     fn open_files(&self, inbox: Inbox) {

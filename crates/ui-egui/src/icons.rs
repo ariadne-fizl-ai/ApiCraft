@@ -6,6 +6,7 @@ pub const FONT_BYTES: &[u8] = include_bytes!("../assets/Phosphor.ttf");
 
 pub const ARROW_DOWN: &str = "\u{E03E}";
 pub const ARROW_UP: &str = "\u{E08E}";
+pub const ARROWS_CLOCKWISE: &str = "\u{E094}";
 pub const CARET_DOUBLE_LEFT: &str = "\u{E128}";
 pub const CARET_DOWN: &str = "\u{E136}";
 pub const CARET_RIGHT: &str = "\u{E13A}";
@@ -28,7 +29,9 @@ pub const PENCIL: &str = "\u{E3B4}";
 pub const PLAY: &str = "\u{E3D0}";
 pub const PLUGS_CONNECTED: &str = "\u{EB5A}";
 pub const PLUS: &str = "\u{E3D4}";
+pub const REPEAT: &str = "\u{E3F6}";
 pub const SEND: &str = "\u{E396}";
+pub const SHIELD_CHECK: &str = "\u{E40C}";
 pub const STACK: &str = "\u{E466}";
 pub const STOP: &str = "\u{E46C}";
 pub const SUN: &str = "\u{E472}";

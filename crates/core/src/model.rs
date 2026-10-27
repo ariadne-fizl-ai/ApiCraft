@@ -30,6 +30,9 @@ pub struct Catalog {
     /// collection variables, and persist until cleared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime: Vec<KeyValue>,
+    /// Proxy and TLS settings for every request.
+    #[serde(default, skip_serializing_if = "NetworkSettings::is_default")]
+    pub network: NetworkSettings,
 }
 
 fn default_format() -> String {
@@ -49,6 +52,7 @@ impl Default for Catalog {
             active_environment: None,
             workflows: Vec::new(),
             runtime: Vec::new(),
+            network: NetworkSettings::default(),
         }
     }
 }
@@ -66,6 +70,11 @@ pub struct Collection {
     pub auth: Auth,
     #[serde(default)]
     pub items: Vec<Item>,
+    /// A folder on disk that holds this collection as one text file per
+    /// request and workflow (see [`crate::folder`]). The catalog then keeps
+    /// only this link; the files are the source of truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
 }
 
 fn no_auth() -> Auth {
@@ -74,7 +83,7 @@ fn no_auth() -> Auth {
 
 impl Collection {
     pub fn new(name: impl Into<String>) -> Self {
-        Collection { id: new_id(), name: name.into(), description: String::new(), variables: Vec::new(), auth: Auth::None, items: Vec::new() }
+        Collection { id: new_id(), name: name.into(), description: String::new(), variables: Vec::new(), auth: Auth::None, items: Vec::new(), directory: None }
     }
 }
 
@@ -364,10 +373,23 @@ pub enum Auth {
     #[serde(rename = "awsv4")]
     AwsSigV4(AwsSigV4),
     Jwt(JwtAuth),
+    /// Mutual TLS: the client presents a certificate during the handshake.
+    #[serde(rename = "clientcert")]
+    ClientCert(ClientCertAuth),
+}
+
+/// PEM text, or the path of a PEM file, for each part.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientCertAuth {
+    /// The certificate (and any intermediates).
+    pub certificate: String,
+    /// The unencrypted private key (PKCS#8, PKCS#1 or SEC1).
+    pub key: String,
 }
 
 impl Auth {
-    pub const KINDS: [(&'static str, &'static str); 10] = [
+    pub const KINDS: [(&'static str, &'static str); 11] = [
         ("inherit", "Inherit from collection"),
         ("none", "No auth"),
         ("basic", "Basic"),
@@ -378,6 +400,7 @@ impl Auth {
         ("oauth1", "OAuth 1.0a"),
         ("awsv4", "AWS Signature v4"),
         ("jwt", "JWT (signed here)"),
+        ("clientcert", "Client certificate (mTLS)"),
     ];
 
     pub fn key(&self) -> &'static str {
@@ -392,6 +415,7 @@ impl Auth {
             Auth::OAuth1(_) => "oauth1",
             Auth::AwsSigV4(_) => "awsv4",
             Auth::Jwt(_) => "jwt",
+            Auth::ClientCert(_) => "clientcert",
         }
     }
 
@@ -411,6 +435,7 @@ impl Auth {
             "oauth1" => Auth::OAuth1(OAuth1::default()),
             "awsv4" => Auth::AwsSigV4(AwsSigV4::default()),
             "jwt" => Auth::Jwt(JwtAuth::default()),
+            "clientcert" => Auth::ClientCert(ClientCertAuth::default()),
             _ => Auth::None,
         }
     }
@@ -710,6 +735,36 @@ pub struct WorkflowStep {
     pub extract: Vec<Extraction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// Repeat this step (and the next `steps - 1`) once per item of a list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_each: Option<ForEach>,
+}
+
+/// A loop over a list held in a variable, usually captured from an earlier
+/// response. Each item is available as `{{item}}` (named by `item`), its
+/// fields as `{{item.field}}`, and its position as `{{$index}}` (from 0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForEach {
+    /// The variable holding the list: a JSON array, or lines of text.
+    pub list: String,
+    /// A JSON path into the variable, e.g. `$.value` or `$.items[*].id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default = "default_item")]
+    pub item: String,
+    /// How many steps, starting with this one, repeat for each item.
+    #[serde(default = "one")]
+    pub steps: u32,
+}
+
+fn default_item() -> String {
+    "item".into()
+}
+
+impl Default for ForEach {
+    fn default() -> Self {
+        ForEach { list: String::new(), path: String::new(), item: default_item(), steps: 1 }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -718,7 +773,89 @@ fn is_zero(n: &u32) -> bool {
 
 impl WorkflowStep {
     pub fn new(request_id: impl Into<String>) -> Self {
-        WorkflowStep { id: new_id(), request_id: request_id.into(), enabled: true, delay_ms: 0, extract: Vec::new(), checks: Vec::new() }
+        WorkflowStep { id: new_id(), request_id: request_id.into(), enabled: true, delay_ms: 0, extract: Vec::new(), checks: Vec::new(), for_each: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    /// The `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY` environment variables.
+    #[default]
+    System,
+    None,
+    Manual,
+}
+
+/// Proxy and TLS settings, kept with the catalog so the desktop app, the
+/// agent and the CLI all send the same way. `{{variables}}` work in them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkSettings {
+    pub proxy: ProxyMode,
+    /// `http://host:port`, `https://...` or `socks5://...`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proxy_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proxy_username: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proxy_password: String,
+    /// Hosts that skip the proxy, comma separated (`localhost,.internal`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub no_proxy: String,
+    /// Check server certificates. Turning this off accepts any certificate.
+    pub verify_tls: bool,
+    /// CA certificates to trust instead of the built-in roots: PEM text or
+    /// the path of a PEM file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ca_certificates: String,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        NetworkSettings {
+            proxy: ProxyMode::System,
+            proxy_url: String::new(),
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            no_proxy: String::new(),
+            verify_tls: true,
+            ca_certificates: String::new(),
+        }
+    }
+}
+
+impl NetworkSettings {
+    pub fn is_default(&self) -> bool {
+        *self == NetworkSettings::default()
+    }
+
+    /// The options a request is sent with, `{{variables}}` substituted.
+    pub fn connect_options(&self, vars: &crate::vars::Vars) -> crate::http::ConnectOptions {
+        let proxy = match self.proxy {
+            ProxyMode::System => None,
+            ProxyMode::None => Some(String::new()),
+            ProxyMode::Manual => {
+                let url = vars.apply(self.proxy_url.trim());
+                let user = vars.apply(&self.proxy_username);
+                let url = if user.is_empty() || url.is_empty() {
+                    url
+                } else {
+                    // user:password@ goes after the scheme.
+                    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url.as_str()));
+                    let enc = crate::prepare::percent_encode;
+                    format!("{scheme}://{}:{}@{rest}", enc(&user), enc(&vars.apply(&self.proxy_password)))
+                };
+                Some(url)
+            }
+        };
+        crate::http::ConnectOptions {
+            proxy,
+            no_proxy: vars.apply(&self.no_proxy),
+            insecure: !self.verify_tls,
+            ca: vars.apply(self.ca_certificates.trim()),
+            ..Default::default()
+        }
     }
 }
 

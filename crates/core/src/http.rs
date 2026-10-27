@@ -20,6 +20,33 @@ pub struct HttpRequest {
     pub grpc: bool,
     #[serde(default)]
     pub timeout_ms: u32,
+    /// Proxy, certificate checks and client certificate. Only native
+    /// senders (the desktop app and the agent) can honour these.
+    #[serde(default, skip_serializing_if = "ConnectOptions::is_default")]
+    pub connect: ConnectOptions,
+}
+
+/// How to connect: see [`crate::model::NetworkSettings`]. Certificates and
+/// keys are PEM text or the path of a PEM file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectOptions {
+    /// `None`: the system proxy (environment variables). `Some("")`: no
+    /// proxy. Otherwise the proxy URL, credentials included.
+    pub proxy: Option<String>,
+    pub no_proxy: String,
+    /// Accept any server certificate.
+    pub insecure: bool,
+    /// CA certificates that replace the built-in roots.
+    pub ca: String,
+    pub client_cert: String,
+    pub client_key: String,
+}
+
+impl ConnectOptions {
+    pub fn is_default(&self) -> bool {
+        *self == ConnectOptions::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -67,6 +94,10 @@ pub trait Transport {
     fn sleep(&self, ms: u32) -> LocalBoxFuture<'_, ()>;
     /// Unix time in ms.
     fn now_ms(&self) -> u64;
+    /// False for senders that ignore [`ConnectOptions`] (the browser's fetch).
+    fn honours_connect_options(&self) -> bool {
+        true
+    }
 
     /// Runs an MCP session over stdio or the legacy SSE transport. Only hosts
     /// that can start processes or hold streams open (the desktop app, the

@@ -98,6 +98,13 @@ pub fn apply(auth: &Auth, req: &mut HttpRequest, now_ms: u64) -> Result<(), Stri
                 req.headers.push(("Authorization".into(), prefixed(&j.header_prefix, &token)));
             }
         }
+        Auth::ClientCert(c) => {
+            if c.certificate.trim().is_empty() || c.key.trim().is_empty() {
+                return Err("Client certificate: set both the certificate and the private key".into());
+            }
+            req.connect.client_cert = c.certificate.trim().to_string();
+            req.connect.client_key = c.key.trim().to_string();
+        }
     }
     Ok(())
 }
@@ -410,6 +417,7 @@ pub fn token_request(o: &OAuth2, grant: TokenGrant) -> Result<HttpRequest, Strin
         url: o.token_url.trim().into(),
         headers,
         body: form_urlencode(&form).into_bytes(),
+        connect: Default::default(),
         grpc: false,
         timeout_ms: 30_000,
     })

@@ -73,9 +73,11 @@ pub fn send(req: HttpRequest) -> Result<HttpResponse, String> {
     }
     // No body at all (rather than `Content-Length: 0`) when there's nothing to send.
     let resp = if req.body.is_empty() {
-        agent().run(builder.body(ureq::SendBody::none()).map_err(|e| format!("invalid request: {e}"))?)
+        let r = builder.body(ureq::SendBody::none()).map_err(|e| format!("invalid request: {e}"))?;
+        agent().run(crate::connect::configure(agent(), r, &req.connect)?)
     } else {
-        agent().run(builder.body(req.body).map_err(|e| format!("invalid request: {e}"))?)
+        let r = builder.body(req.body).map_err(|e| format!("invalid request: {e}"))?;
+        agent().run(crate::connect::configure(agent(), r, &req.connect)?)
     }
     .map_err(|e| format!("{e}"))?;
     let status = resp.status();
@@ -124,13 +126,7 @@ async fn grpc_call(req: HttpRequest) -> Result<HttpResponse, String> {
     let body = bytes::Bytes::from(req.body);
 
     let (status, headers, data, trailers) = if u.is_tls() {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut config = crate::connect::rustls_config(&req.connect)?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         let name = rustls::pki_types::ServerName::try_from(u.host.trim_matches(['[', ']']).to_string()).map_err(|e| format!("bad TLS name: {e}"))?;
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp).await.map_err(|e| format!("TLS: {e}"))?;

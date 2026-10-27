@@ -16,7 +16,7 @@ path = "src/main.rs"
 apicraft-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "socks-proxy"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"

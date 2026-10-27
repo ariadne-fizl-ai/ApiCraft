@@ -9,7 +9,7 @@
 use crate::auth::{self, TokenGrant, TokenResult};
 use crate::extract::{self, CheckResult, ResponseView};
 use crate::grpc::{self, GrpcResult};
-use crate::http::{HttpRequest, HttpResponse, Transport};
+use crate::http::{ConnectOptions, HttpRequest, HttpResponse, Transport};
 use crate::ids::new_id;
 use crate::model::{Auth, Catalog, Check, Extraction, GrantType, KeyValue, Protocol, VarScope};
 use crate::prepare::{multipart, prepare, Prepared, PreparedBody};
@@ -115,19 +115,21 @@ pub fn build_wire(catalog: &Catalog, request_id: &str, workflow_vars: &[KeyValue
         body,
         grpc: prepared.grpc.is_some() && native_grpc,
         timeout_ms: 60_000,
+        connect: catalog.network.connect_options(&vars),
     };
     Ok(Wire { prepared, http, auth, auth_owner: owner, vars })
 }
 
 /// Makes sure an OAuth 2 auth holds a usable token, fetching one if it can.
-pub async fn ensure_oauth_token(o: &mut crate::model::OAuth2, transport: &dyn Transport) -> Result<Option<TokenResult>, String> {
+/// Token requests go out with `connect` (the proxy and certificates).
+pub async fn ensure_oauth_token(o: &mut crate::model::OAuth2, connect: &ConnectOptions, transport: &dyn Transport) -> Result<Option<TokenResult>, String> {
     let now = transport.now_ms();
     if o.token_valid(now) {
         return Ok(None);
     }
     let mut last_err = None;
     if !o.refresh_token.is_empty() && !o.token_url.is_empty() {
-        let r = transport.send(auth::token_request(o, TokenGrant::Refresh)?).await?;
+        let r = transport.send(with_connect(auth::token_request(o, TokenGrant::Refresh)?, connect)).await?;
         match auth::parse_token_response(&r, transport.now_ms()) {
             Ok(t) => {
                 o.access_token = t.access_token.clone();
@@ -138,7 +140,7 @@ pub async fn ensure_oauth_token(o: &mut crate::model::OAuth2, transport: &dyn Tr
     }
     match o.grant {
         GrantType::ClientCredentials | GrantType::Password => {
-            let r = transport.send(auth::token_request(o, TokenGrant::Configured)?).await?;
+            let r = transport.send(with_connect(auth::token_request(o, TokenGrant::Configured)?, connect)).await?;
             let t = auth::parse_token_response(&r, transport.now_ms())?;
             o.access_token = t.access_token.clone();
             Ok(Some(t))
@@ -180,7 +182,7 @@ pub async fn execute(
     let mut auth = wire.auth.clone();
     if let Auth::OAuth2(o) = &mut auth {
         let interactive = matches!(o.grant, GrantType::AuthorizationCode | GrantType::Manual);
-        match ensure_oauth_token(o, transport).await {
+        match ensure_oauth_token(o, &wire.http.connect, transport).await {
             Ok(Some(t)) => out.token = Some((wire.auth_owner.clone(), t)),
             Ok(None) => {}
             // No token that needs a person to sign in: send anyway and let the server decide.
@@ -199,6 +201,16 @@ pub async fn execute(
     if let Err(e) = auth::apply(&auth, &mut http, now) {
         out.error = Some(e);
         return out;
+    }
+    if !transport.honours_connect_options() {
+        let c = &http.connect;
+        if !c.client_cert.is_empty() {
+            out.error = Some("browsers can't send client certificates; start the local agent (apicraft-agent) or use the desktop app".into());
+            return out;
+        }
+        if c.proxy.as_deref().is_some_and(|p| !p.is_empty()) || c.insecure || !c.ca.is_empty() {
+            out.warnings.push("the browser uses its own proxy and certificate settings; start the local agent to use the ones in Settings".into());
+        }
     }
     if req.protocol == Protocol::Mcp {
         execute_mcp(req, &wire, http, transport, extra_extract, extra_checks, &mut out).await;
@@ -321,7 +333,7 @@ pub async fn fetch_schema(catalog: &Catalog, request_id: &str, transport: &dyn T
     }
     let mut auth = wire.auth.clone();
     if let Auth::OAuth2(o) = &mut auth {
-        let _ = ensure_oauth_token(o, transport).await;
+        let _ = ensure_oauth_token(o, &wire.http.connect, transport).await;
     }
     auth::apply(&auth, &mut http, now)?;
     let url = http.url.clone();
@@ -340,6 +352,10 @@ pub async fn fetch_schema(catalog: &Catalog, request_id: &str, transport: &dyn T
     }
 }
 
+fn with_connect(req: HttpRequest, connect: &ConnectOptions) -> HttpRequest {
+    HttpRequest { connect: connect.clone(), ..req }
+}
+
 /// Lists the tools, resources and prompts of the MCP server a request points at.
 pub async fn mcp_discover(catalog: &Catalog, request_id: &str, transport: &dyn Transport) -> Result<crate::mcp::McpCatalog, String> {
     let (_, req) = catalog.find_request(request_id).ok_or("request not found")?;
@@ -347,7 +363,7 @@ pub async fn mcp_discover(catalog: &Catalog, request_id: &str, transport: &dyn T
     let wire = build_wire(catalog, request_id, &[], now, false)?;
     let mut auth = wire.auth.clone();
     if let Auth::OAuth2(o) = &mut auth {
-        let _ = ensure_oauth_token(o, transport).await;
+        let _ = ensure_oauth_token(o, &wire.http.connect, transport).await;
     }
     let mut http = wire.http.clone();
     auth::apply(&auth, &mut http, now)?;
@@ -434,6 +450,7 @@ async fn execute_mcp(
         elapsed_ms: elapsed,
     });
     out.sent = Some(HttpRequest {
+        connect: Default::default(),
         method: "MCP".into(),
         url: target,
         headers,

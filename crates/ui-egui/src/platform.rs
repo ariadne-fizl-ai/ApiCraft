@@ -12,7 +12,7 @@ use std::sync::Arc;
 use apicraft_core::auth::{self, TokenGrant, TokenResult};
 use apicraft_core::engine::{self, Outcome};
 use apicraft_core::http::Transport;
-use apicraft_core::model::{Catalog, OAuth2};
+use apicraft_core::model::{Catalog, Collection, OAuth2, Workflow};
 use apicraft_core::workflow::{self, RunSummary, StepReport};
 
 /// Events delivered to the UI thread.
@@ -54,6 +54,17 @@ pub enum Msg {
         request_id: String,
         result: Result<apicraft_core::engine::ApiSchema, String>,
     },
+    /// A folder was chosen for a collection.
+    FolderPicked {
+        path: String,
+        purpose: FolderPurpose,
+    },
+    /// What a collection folder holds (empty for a new one).
+    FolderLoaded {
+        path: String,
+        purpose: FolderPurpose,
+        result: Result<Box<FolderContents>, String>,
+    },
     /// Replace the in-memory catalog (e.g. loaded from the agent's file).
     ReplaceCatalog {
         catalog: Box<Catalog>,
@@ -61,6 +72,27 @@ pub enum Msg {
     },
     /// Something about the platform changed (agent found, ...): just repaint.
     Refresh,
+}
+
+/// Why a collection folder is being picked or read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FolderPurpose {
+    /// Open a folder as a collection (an empty folder starts a new one).
+    Open,
+    /// Keep this collection in the folder from now on; it must be empty
+    /// or already a collection folder.
+    Link(String),
+    /// Read this linked collection's folder again.
+    Reload(String),
+}
+
+/// A collection read from its folder.
+#[derive(Debug, Clone)]
+pub struct FolderContents {
+    pub collection: Collection,
+    pub workflows: Vec<Workflow>,
+    /// Files that couldn't be read.
+    pub warnings: Vec<String>,
 }
 
 pub enum WsEvent {
@@ -124,6 +156,8 @@ pub enum Job {
         owner: String,
         oauth: Box<OAuth2>,
         code: Option<CodeExchange>,
+        /// The catalog's proxy and certificate settings.
+        connect: apicraft_core::http::ConnectOptions,
     },
 }
 
@@ -165,11 +199,11 @@ pub async fn run_job(job: Job, transport: &dyn Transport, inbox: &Inbox) {
                 Err(e) => inbox.toast(format!("Could not download {url}: {e}"), true),
             }
         }
-        Job::Token { owner, oauth, code } => {
+        Job::Token { owner, oauth, code, connect } => {
             let mut o = *oauth;
             let result = match code {
                 Some(c) => match auth::token_request(&o, TokenGrant::Code { code: &c.code, verifier: &c.verifier, redirect_uri: &c.redirect_uri }) {
-                    Ok(req) => match transport.send(req).await {
+                    Ok(req) => match transport.send(apicraft_core::http::HttpRequest { connect: connect.clone(), ..req }).await {
                         Ok(resp) => auth::parse_token_response(&resp, transport.now_ms()),
                         Err(e) => Err(e),
                     },
@@ -182,7 +216,7 @@ pub async fn run_job(job: Job, transport: &dyn Transport, inbox: &Inbox) {
                     if o.grant != apicraft_core::model::GrantType::Manual {
                         o.refresh_token.clear();
                     }
-                    match engine::ensure_oauth_token(&mut o, transport).await {
+                    match engine::ensure_oauth_token(&mut o, &connect, transport).await {
                         Ok(Some(t)) => Ok(t),
                         Ok(None) => Err("the current token is still valid".into()),
                         Err(e) => Err(e),
@@ -242,6 +276,19 @@ pub trait Platform {
     fn save_file(&self, suggested_name: &str, bytes: Vec<u8>, inbox: Inbox);
     /// Lets the user pick files to import; each arrives as `Msg::FileOpened`.
     fn open_files(&self, inbox: Inbox);
+
+    /// Lets the user choose a folder for a collection; it arrives as
+    /// `Msg::FolderPicked`. Only hosts with file access can.
+    fn pick_folder(&self, purpose: FolderPurpose, inbox: Inbox) {
+        let _ = purpose;
+        inbox.toast("Collection folders need the desktop app or the local agent (apicraft-agent)", true);
+    }
+
+    /// Reads a collection folder (or checks one can be linked); the result
+    /// arrives as `Msg::FolderLoaded`.
+    fn load_folder(&self, path: String, purpose: FolderPurpose, inbox: Inbox) {
+        inbox.post(Msg::FolderLoaded { path, purpose, result: Err("collection folders need the desktop app or the local agent".into()) });
+    }
 
     /// Reads a file dropped on the window; it arrives as `Msg::FileOpened`.
     /// Natively the bytes are read straight away; the web overrides this,

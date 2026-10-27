@@ -9,7 +9,7 @@ use apicraft_core::model::*;
 use apicraft_core::{auth, curl_import, engine, format, postman, soap, store};
 
 use crate::app::{ApiCraftApp, Confirm, Modal, View, WorkflowRun, WsDir, WsEntry, WsSession};
-use crate::platform::{CodeExchange, Job};
+use crate::platform::{CodeExchange, FolderContents, FolderPurpose, Job};
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -49,6 +49,13 @@ pub enum Action {
     DuplicateWorkflow(String),
     OAuthGet(String),
     McpDiscover(String),
+    /// Open a folder of request files as a collection.
+    OpenFolder,
+    /// Keep a collection in a folder of files from now on.
+    LinkFolder(String),
+    ReloadFolder(String),
+    /// Keep the collection in the catalog again; the files stay where they are.
+    UnlinkFolder(String),
     /// Load the GraphQL schema or OData $metadata of a request's server.
     FetchSchema(String),
     /// Add a folder of requests, one per operation, from the loaded schema.
@@ -373,6 +380,20 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
                 app.spawn(Job::McpDiscover { catalog: Box::new(app.catalog.clone()), request_id: id });
             }
         }
+        Action::OpenFolder => app.platform.pick_folder(FolderPurpose::Open, app.inbox.clone()),
+        Action::LinkFolder(id) => app.platform.pick_folder(FolderPurpose::Link(id), app.inbox.clone()),
+        Action::ReloadFolder(id) => {
+            if let Some(dir) = app.catalog.collection(&id).and_then(|c| c.directory.clone()) {
+                app.platform.load_folder(dir, FolderPurpose::Reload(id), app.inbox.clone());
+            }
+        }
+        Action::UnlinkFolder(id) => {
+            if let Some(c) = app.catalog.collections.iter_mut().find(|c| c.id == id) {
+                let dir = c.directory.take().unwrap_or_default();
+                let note = format!("{} is kept in the catalog again; the files in {dir} were left as they are", c.name);
+                app.toast(note, false);
+            }
+        }
         Action::FetchSchema(id) => {
             if app.discovering.insert(id.clone()) {
                 app.spawn(Job::FetchSchema { catalog: Box::new(app.catalog.clone()), request_id: id });
@@ -434,6 +455,62 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
             app.platform.save_file(&format!("{}-response.{ext}", file_stem(&name)), bytes, app.inbox.clone());
         }
     }
+}
+
+// ---------------------------------------------------------------- collection folders
+
+pub fn folder_loaded(app: &mut ApiCraftApp, path: &str, purpose: FolderPurpose, result: Result<FolderContents, String>) {
+    let contents = match result {
+        Ok(c) => c,
+        Err(e) => return app.toast(e, true),
+    };
+    for w in &contents.warnings {
+        app.toast(format!("Skipped {w}"), true);
+    }
+    match purpose {
+        FolderPurpose::Open => {
+            if let Some(c) = app.catalog.collections.iter().find(|c| c.directory.as_deref() == Some(path)) {
+                let name = c.name.clone();
+                app.expanded.insert(c.id.clone());
+                return app.toast(format!("{name} is already open from that folder"), false);
+            }
+            let mut col = contents.collection;
+            col.directory = Some(path.to_string());
+            // A copied folder keeps its ids; give it new ones if they clash.
+            if app.catalog.collection(&col.id).is_some() {
+                col.id = apicraft_core::ids::new_id();
+            }
+            let count = count_requests(&col.items);
+            app.expanded.insert(col.id.clone());
+            let name = col.name.clone();
+            app.catalog.collections.push(col);
+            let existing: std::collections::HashSet<String> = app.catalog.workflows.iter().map(|w| w.id.clone()).collect();
+            let wfs = contents.workflows.len();
+            app.catalog.workflows.extend(contents.workflows.into_iter().filter(|w| !existing.contains(&w.id)));
+            app.toast(format!("Opened {name} from {path}: {count} request(s), {wfs} workflow(s)"), false);
+        }
+        FolderPurpose::Link(id) => {
+            if let Some(c) = app.catalog.collections.iter_mut().find(|c| c.id == id) {
+                c.directory = Some(path.to_string());
+                let note = format!("{} is now saved as files in {path}", c.name);
+                app.toast(note, false);
+            }
+        }
+        FolderPurpose::Reload(id) => {
+            apicraft_core::folder::merge_linked(&mut app.catalog, &id, contents.collection, contents.workflows);
+            app.toast("Reloaded from the folder", false);
+        }
+    }
+}
+
+fn count_requests(items: &[Item]) -> usize {
+    items
+        .iter()
+        .map(|i| match i {
+            Item::Request(_) => 1,
+            Item::Folder(f) => count_requests(&f.items),
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------- editing helpers
@@ -680,7 +757,8 @@ fn oauth_get(app: &mut ApiCraftApp, owner: &str) {
         }
         return;
     }
-    app.spawn(Job::Token { owner: owner.to_string(), oauth: Box::new(o), code: None });
+    let connect = network_options(app);
+    app.spawn(Job::Token { owner: owner.to_string(), oauth: Box::new(o), code: None, connect });
 }
 
 /// The provider sent the browser back with `?code=...&state=...`.
@@ -696,9 +774,17 @@ pub fn finish_authorization(app: &mut ApiCraftApp, query: &str) {
     }
     let Some(code) = get("code") else { return app.toast("Sign-in response had no code", true) };
     let Some(o) = resolved_oauth(app, &pending.owner) else { return };
+    let connect = network_options(app);
     app.spawn(Job::Token {
         owner: pending.owner,
         oauth: Box::new(o),
         code: Some(CodeExchange { code, verifier: pending.verifier, redirect_uri: pending.redirect_uri }),
+        connect,
     });
+}
+
+/// The catalog's proxy and certificate settings, with variables applied.
+fn network_options(app: &ApiCraftApp) -> apicraft_core::http::ConnectOptions {
+    let vars = apicraft_core::vars::Vars::for_request(&app.catalog, None, &[], app.platform.now_ms());
+    app.catalog.network.connect_options(&vars)
 }

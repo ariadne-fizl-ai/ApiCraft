@@ -6,6 +6,7 @@ A Postman/Insomnia-style API client written in Rust. One user interface, built w
 
 - **Protocols:** REST, GraphQL (POST or GET, variables, operation picker, schema browser from introspection), OData v2/v3/v4 (resource paths, a `$select`/`$expand`/`$filter`/`$orderby`/`$top`/`$skip`/`$count`/`$search` builder that offers fields from `$metadata`, and the version headers), SOAP 1.1/1.2, gRPC (unary and server-streaming, from a pasted `.proto`, with no code generation), WebSocket, and **MCP** servers over stdio, legacy SSE or Streamable HTTP.
 - **Catalogs:** collections, folders and requests, plus environments, workflows and captured variables. Stored as **gzip-compressed JSON**: a file on the desktop, browser storage on the web. Both export and import as `.json.gz` or plain `.json` text.
+- **Collections as folders of text files:** open a folder, or save a collection as one, and it's kept as `collection.json` plus one pretty-printed `.request.json` file per request (subfolders for folders) and a `.workflow.json` per workflow, ready for version control. Files added or edited by hand are picked up; the desktop app reloads when they change on disk. The CLI accepts such a folder in place of a catalog file.
 - **Save as code:** any request as a **curl** or **PowerShell** command (`grpcurl` for gRPC, a `ClientWebSocket` script for WebSockets).
 - **Import** (file picker, drag-and-drop, paste, or URL): Postman collections (v2.0/v2.1) and environments, curl commands, catalog files, and:
   - **OpenAPI 3.x / Swagger 2.0** (JSON or YAML). Each operation becomes a request, grouped by tag, with example parameters and bodies built from the schemas, the server URL and path parameters as variables, and security schemes mapped onto auth. Test artifacts are generated: checks per operation (documented status, required fields), a smoke-test workflow over the safe GETs, and CRUD workflows where "create" captures the new id for get/update/delete.
@@ -14,10 +15,11 @@ A Postman/Insomnia-style API client written in Rust. One user interface, built w
   - **GraphQL introspection results** (JSON): one request per query and mutation, with a selection set and example variables. From a GraphQL request, **Load schema** does the same against the live endpoint.
 
   Collections export back to Postman v2.1.
-- **Workflows:** run saved requests in a set order, with per-step delays, extra captures and checks, iterations, and stop-on-failure.
+- **Workflows:** run saved requests in a set order, with per-step delays, extra captures and checks, iterations, and stop-on-failure. A step can **loop over a list** captured earlier (a JSON array, a path such as `$.value` or `$.items[*].id`, or lines of text), repeating it and the next few steps once per item with `{{item}}`, `{{item.field}}` and `{{$index}}`. Exported Bash and PowerShell scripts loop the same way.
 - **Variables from responses:** capture rules (JSON path, XML path, header, status, regex) store values as `{{variables}}` for later requests. Postman's dynamic variables also work (`{{$guid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`).
 - **Checks:** status (`200`, `2xx`, `200-204`), body contains, JSON value, header, response time.
-- **Auth:** Basic, Digest (MD5/SHA-256, `-sess`, `qop`), Bearer, API key, OAuth 2.0 (client credentials, password, authorization code with PKCE, refresh, automatic renewal), OAuth 1.0a, AWS Signature v4, JWT (HS256/384/512). Requests can inherit their collection's auth.
+- **Auth:** Basic, Digest (MD5/SHA-256, `-sess`, `qop`), Bearer, API key, OAuth 2.0 (client credentials, password, authorization code with PKCE, refresh, automatic renewal), OAuth 1.0a, AWS Signature v4, JWT (HS256/384/512), client certificates (mutual TLS, PEM text or files). Requests can inherit their collection's auth.
+- **Network settings:** system, no, or manual proxy (HTTP, HTTPS or SOCKS5, with credentials and a bypass list), turning certificate checks off, and trusting your own CA certificates instead of the built-in roots. They're kept with the catalog, so the desktop app, the agent and the CLI all use them, and generated curl/PowerShell includes them.
 - **MCP server:** agents such as Claude Code can drive Fizl ApiCraft (list, send, create and import requests, run workflows); see below.
 
 ## Layout
@@ -165,7 +167,9 @@ Anything else is kept in the request's Docs tab.
 - **OData:** `$batch` requests aren't built for you; send them as raw multipart bodies.
 - **gRPC:** client-streaming and bidirectional calls aren't supported. Proto imports other than `google/protobuf/*` must be inlined.
 - **Multipart bodies:** text fields only.
-- **Other auth:** NTLM and Kerberos aren't supported.
+- **Other auth:** NTLM and Kerberos aren't supported. Client certificate keys must be unencrypted PEM (no PKCS#12 or passphrases).
+- **Network settings:** the browser build ignores them unless requests go through the agent. The proxy applies to HTTP requests, not to native gRPC, WebSockets or MCP sessions (certificate settings do apply to native gRPC).
+- **Loops:** loops don't nest, and a loop covers a run of consecutive steps.
 - **Generated scripts:** signatures for OAuth 1.0a, AWS SigV4 and JWT are computed when the script is generated, so they expire. For AWS, curl uses its own `--aws-sigv4` instead.
 - **Fonts and icons:** Phosphor icons (MIT) are bundled in `crates/ui-egui/assets`. The desktop app uses Segoe UI on Windows.
 

@@ -15,7 +15,7 @@ use apicraft_core::store;
 use apicraft_core::workflow;
 use serde_json::{json, Value};
 
-use crate::{now_ms, server::write_atomic, NativeTransport};
+use crate::{now_ms, NativeTransport};
 
 pub const SERVER_NAME: &str = "fizl-apicraft";
 const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -97,15 +97,14 @@ impl McpServer {
     }
 
     fn load(&self) -> Result<Catalog, String> {
-        match std::fs::read(&self.catalog_path) {
-            Ok(bytes) => Ok(store::decode(&bytes)?.into_catalog()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Catalog::default()),
-            Err(e) => Err(format!("reading {}: {e}", self.catalog_path.display())),
+        if !self.catalog_path.exists() {
+            return Ok(Catalog::default());
         }
+        crate::folders::load(&self.catalog_path).map(|(cat, _)| cat)
     }
 
     fn save(&self, cat: &Catalog) -> Result<(), String> {
-        write_atomic(&self.catalog_path, &store::to_gzip(cat)).map_err(|e| format!("writing {}: {e}", self.catalog_path.display()))
+        crate::folders::save(&self.catalog_path, cat).map_err(|e| format!("writing {e}"))
     }
 
     /// Handles one JSON-RPC message; returns the response for requests.

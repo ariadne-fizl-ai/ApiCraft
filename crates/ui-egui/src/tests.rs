@@ -130,6 +130,7 @@ fn outcome_for(app: &ApiCraftApp, id: &str, body: &str, content_type: &str) -> O
         request_id: id.into(),
         request_name: name,
         sent: Some(HttpRequest {
+            connect: Default::default(),
             method: "POST".into(),
             url: "https://api.test/x".into(),
             headers: vec![("Accept".into(), "*/*".into())],

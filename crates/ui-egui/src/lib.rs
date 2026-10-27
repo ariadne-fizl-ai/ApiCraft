@@ -15,7 +15,7 @@ pub mod theme;
 mod views;
 
 pub use app::ApiCraftApp;
-pub use platform::{run_job, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
+pub use platform::{run_job, FolderContents, FolderPurpose, Inbox, Job, Level, Msg, Platform, Status, WsConn, WsEvent};
 
 /// The name used for windows, storage keys and file locations.
 pub const APP_NAME: &str = "Fizl ApiCraft";

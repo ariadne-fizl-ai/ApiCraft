@@ -645,7 +645,8 @@ fn pm_params(pairs: &[(&str, String)]) -> Value {
 
 fn export_auth(a: &Auth) -> Option<Value> {
     Some(match a {
-        Auth::Inherit => return None,
+        // Postman keeps client certificates in its settings, not on requests.
+        Auth::Inherit | Auth::ClientCert(_) => return None,
         Auth::None => json!({ "type": "noauth" }),
         Auth::Basic { username, password } => json!({ "type": "basic", "basic": pm_params(&[("username", username.clone()), ("password", password.clone())]) }),
         Auth::Digest { username, password } => {

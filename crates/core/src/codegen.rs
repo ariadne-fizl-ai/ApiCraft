@@ -68,7 +68,66 @@ fn request_plan(catalog: &Catalog, request_id: &str, vars: &Vars, now_ms: u64, t
     mcp.command = vars.apply(&mcp.command);
     mcp.args = mcp.args.iter().map(|a| vars.apply(a)).collect();
     mcp.target = vars.apply(&mcp.target);
-    Ok((plan(p, &auth, now_ms, target)?, mcp))
+    let mut connect = catalog.network.connect_options(vars);
+    if let Auth::ClientCert(c) = &auth {
+        connect.client_cert = c.certificate.trim().to_string();
+        connect.client_key = c.key.trim().to_string();
+    }
+    let mut plan = plan(p, &auth, now_ms, target)?;
+    connect_options(&mut plan, &connect, target);
+    Ok((plan, mcp))
+}
+
+/// Proxy and certificate settings as curl options or PowerShell parameters.
+/// Certificates given as PEM text (rather than a file) can't be passed on a
+/// command line, so they become a note.
+fn connect_options(plan: &mut Plan, c: &crate::http::ConnectOptions, target: Target) {
+    let is_file = |s: &str| !s.contains("-----BEGIN");
+    match (&c.proxy, target) {
+        (Some(p), Target::Curl) if p.is_empty() => plan.curl_auth.push("--noproxy '*'".into()),
+        (Some(p), Target::Curl) => plan.curl_auth.push(format!("--proxy {}", sh(p))),
+        (Some(p), Target::PowerShell) if p.is_empty() => plan.ps_params.push("-NoProxy".into()),
+        (Some(p), Target::PowerShell) => plan.ps_params.push(format!("-Proxy {}", ps(p))),
+        (None, _) => {}
+    }
+    if !c.no_proxy.is_empty() && target == Target::Curl && c.proxy.as_deref() != Some("") {
+        plan.curl_auth.push(format!("--noproxy {}", sh(&c.no_proxy)));
+    }
+    if c.insecure {
+        match target {
+            Target::Curl => plan.curl_auth.push("--insecure".into()),
+            Target::PowerShell => plan.ps_params.push("-SkipCertificateCheck".into()),
+        }
+    }
+    if !c.ca.is_empty() {
+        match target {
+            Target::Curl if is_file(&c.ca) => plan.curl_auth.push(format!("--cacert {}", sh(&c.ca))),
+            Target::Curl => plan.notes.push("Custom CA certificates are pasted PEM in Settings; save them to a file and add --cacert FILE.".into()),
+            Target::PowerShell => {
+                plan.notes.push("PowerShell trusts the system's CA store; add the custom CA certificates there (or use -SkipCertificateCheck).".into())
+            }
+        }
+    }
+    if !c.client_cert.is_empty() {
+        if is_file(&c.client_cert) && is_file(&c.client_key) {
+            match target {
+                Target::Curl => {
+                    plan.curl_auth.push(format!("--cert {}", sh(&c.client_cert)));
+                    plan.curl_auth.push(format!("--key {}", sh(&c.client_key)));
+                }
+                Target::PowerShell => {
+                    plan.ps_setup.push(format!(
+                        "$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile({}, {})",
+                        ps(&c.client_cert),
+                        ps(&c.client_key)
+                    ));
+                    plan.ps_params.push("-Certificate $certificate".into());
+                }
+            }
+        } else {
+            plan.notes.push("Client certificate: it's pasted PEM in the Auth tab; save the certificate and key to files to use them here.".into());
+        }
+    }
 }
 
 fn plan(p: Prepared, auth: &Auth, now_ms: u64, target: Target) -> Result<Plan, String> {
@@ -109,7 +168,15 @@ fn plan(p: Prepared, auth: &Auth, now_ms: u64, target: Target) -> Result<Plan, S
                 PreparedBody::Text(t) => t.clone().into_bytes(),
                 _ => Vec::new(),
             };
-            let mut tmp = HttpRequest { method: plan.p.method.clone(), url: plan.url.clone(), headers: plan.headers.clone(), body, grpc: false, timeout_ms: 0 };
+            let mut tmp = HttpRequest {
+                method: plan.p.method.clone(),
+                url: plan.url.clone(),
+                headers: plan.headers.clone(),
+                body,
+                grpc: false,
+                timeout_ms: 0,
+                ..Default::default()
+            };
             auth::apply(auth, &mut tmp, now_ms)?;
             plan.headers = tmp.headers;
             plan.url = tmp.url;
@@ -177,6 +244,8 @@ fn curl_parts(plan: &Plan) -> Vec<String> {
     } else if (p.method != "GET" || has_body) && !(p.method == "POST" && has_body) {
         parts.push(format!("--request {}", p.method));
     }
+    // The app follows redirects, so the command does too.
+    parts.push("--location".into());
     parts.push(format!("--url {}", sh(&plan.url)));
     let multipart = matches!(p.body, PreparedBody::Multipart(_));
     for (k, v) in &plan.headers {
@@ -555,7 +624,7 @@ mod tests {
         let c = generate(&cat, &id, 0, Target::Curl).unwrap();
         assert_eq!(
             c,
-            "curl --url 'https://api.test/items' \\\n  --header 'X-Note: it'\\''s' \\\n  --header 'Content-Type: application/json' \\\n  --header 'Authorization: Bearer tok' \\\n  --data-raw '{\"a\":\"b\"}'\n"
+            "curl --location \\\n  --url 'https://api.test/items' \\\n  --header 'X-Note: it'\\''s' \\\n  --header 'Content-Type: application/json' \\\n  --header 'Authorization: Bearer tok' \\\n  --data-raw '{\"a\":\"b\"}'\n"
         );
         let p = generate(&cat, &id, 0, Target::PowerShell).unwrap();
         assert!(p.contains("'X-Note' = 'it''s'"), "{p}");

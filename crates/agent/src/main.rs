@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use apicraft_agent::{default_catalog_path, now_ms, server, NativeTransport};
+use apicraft_agent::{default_catalog_path, folders, now_ms, server, NativeTransport};
 use apicraft_core::codegen::{self, Target};
 use apicraft_core::engine::{self, apply_outcome};
 use apicraft_core::http::HttpRequest;
@@ -38,8 +38,10 @@ USAGE:
            While `serve` runs it's also at http://127.0.0.1:<port>/mcp (Streamable
            HTTP) and /sse (legacy SSE).
 
-Catalog files are JSON, plain or gzip-compressed (.json.gz). Without a catalog
-argument, commands use the desktop app's catalog file.";
+Catalog files are JSON, plain or gzip-compressed (.json.gz). A collection folder
+(a collection.json plus a .request.json file per request) works as a catalog too,
+and collections the catalog links to folders are read from them. Without a
+catalog argument, commands use the desktop app's catalog file.";
 
 struct Args(Vec<String>);
 
@@ -142,14 +144,17 @@ fn catalog_arg(args: &mut Args) -> String {
     args.positional().unwrap_or_else(|| default_catalog_path().display().to_string())
 }
 
+/// A catalog file, or a collection folder; linked folders are read in.
 fn load_catalog(path: &str) -> Result<Catalog, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
-    Ok(store::decode(&bytes)?.into_catalog())
+    let (cat, warnings) = folders::load(Path::new(path)).map_err(|e| format!("reading {e}"))?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(cat)
 }
 
 fn save_catalog(path: &str, cat: &Catalog) -> Result<(), String> {
-    let bytes = if path.ends_with(".gz") { store::to_gzip(cat) } else { store::to_json(cat).into_bytes() };
-    server::write_atomic(Path::new(path), &bytes).map_err(|e| format!("writing {path}: {e}"))
+    folders::save(Path::new(path), cat).map_err(|e| format!("writing {e}"))
 }
 
 fn find_by_name<'a>(items: impl Iterator<Item = (&'a str, &'a str)>, wanted: &str) -> Result<String, String> {
@@ -236,6 +241,9 @@ fn cmd_run(mut args: Args) -> Result<bool, String> {
             println!("Workflow {name}");
             let mut outcomes = Vec::new();
             let summary = pollster::block_on(workflow::run(&cat, &id, &t, &mut |r| {
+                if let Some(item) = r.item.as_ref().filter(|_| loop_head(&cat, &id, r.index)) {
+                    println!("      [{}/{}] {}", item.index + 1, item.count, item.label);
+                }
                 let prefix = format!("  {:>2}. ", r.index + 1);
                 match (&r.outcome, &r.skipped) {
                     (Some(o), _) => {
@@ -322,4 +330,9 @@ fn cmd_export(mut args: Args) -> Result<bool, String> {
     };
     print!("{code}");
     Ok(true)
+}
+
+/// True for the first step of a loop, where each pass is announced.
+fn loop_head(cat: &Catalog, workflow_id: &str, index: usize) -> bool {
+    cat.workflow(workflow_id).and_then(|w| w.steps.get(index)).is_some_and(|s| s.for_each.is_some())
 }
