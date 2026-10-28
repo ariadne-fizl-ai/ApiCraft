@@ -18,6 +18,7 @@ path = "src/main.rs"
 apicraft-core = { path = "../../crates/core" }
 apicraft-ui = { path = "../../crates/ui-egui" }
 egui = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
 
 # Only the WebAssembly build has a browser to talk to.
@@ -34,6 +35,6 @@ version = "0.3"
 features = [
   "AbortController", "AbortSignal", "BinaryType", "Blob", "BlobPropertyBag", "CloseEvent", "Document", "Element",
   "Event", "EventTarget", "Headers", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlElement", "Location",
-  "MessageEvent", "Performance", "Request", "RequestCredentials", "RequestInit", "RequestMode", "RequestRedirect",
+  "MessageEvent", "Navigator", "Performance", "Request", "RequestCredentials", "RequestInit", "RequestMode", "RequestRedirect",
   "Response", "Storage", "Url", "WebSocket", "Window",
 ]

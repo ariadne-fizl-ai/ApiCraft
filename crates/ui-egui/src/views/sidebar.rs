@@ -46,7 +46,11 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
         }
     });
     ui.add_space(8.0);
-    ui.add(egui::TextEdit::singleline(&mut app.filter).hint_text(format!("{} Filter requests", icons::MAGNIFYING_GLASS)).desired_width(f32::INFINITY));
+    let filter =
+        ui.add(egui::TextEdit::singleline(&mut app.filter).hint_text(format!("{} Filter requests", icons::MAGNIFYING_GLASS)).desired_width(f32::INFINITY));
+    if std::mem::take(&mut app.focus_filter) {
+        filter.request_focus();
+    }
     ui.add_space(4.0);
 
     let footer_h = 40.0;
@@ -121,10 +125,12 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
     // footer
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(format!("{} Import", icons::UPLOAD)).frame(false)).on_hover_text("Postman, catalog files or curl").clicked() {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+            if ui.add(egui::Button::new(footer_text(icons::UPLOAD, "Import")).frame(false)).on_hover_text("Postman, OpenAPI, catalog files or curl").clicked() {
                 app.actions.push(Action::ImportInto(None));
             }
-            ui.menu_button(format!("{} Export", icons::DOWNLOAD), |ui| {
+            let export = ui.add(egui::Button::new(footer_text(icons::DOWNLOAD, "Export")).frame(false));
+            egui::Popup::menu(&export).show(|ui| {
                 ui.label(RichText::new("WHOLE CATALOG").size(11.0).color(p.faint));
                 if ui.button("Save .json.gz (compressed)").clicked() {
                     app.actions.push(Action::ExportCatalogGz);
@@ -136,7 +142,11 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, icons::GEAR, "Settings").clicked() {
+                if ui
+                    .add(egui::Button::new(footer_text(icons::GEAR, "Settings")).frame(false))
+                    .on_hover_text("Theme, network, proxy and certificates")
+                    .clicked()
+                {
                     app.modal = Some(Modal::Settings);
                 }
             });
@@ -144,6 +154,107 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui) {
         let r = ui.min_rect();
         ui.painter().hline(r.x_range(), r.top() - 4.0, Stroke::new(1.0, p.border));
     });
+}
+
+/// A footer label with a larger icon.
+fn footer_text(icon: &str, label: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(icon, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(17.0), valign: Align::Center, ..Default::default() });
+    job.append(label, 6.0, egui::TextFormat { font_id: egui::FontId::proportional(13.5), valign: Align::Center, ..Default::default() });
+    job
+}
+
+/// The sidebar folded away: a strip of icons for the things used most.
+pub fn rail(app: &mut ApiCraftApp, ui: &mut Ui) {
+    let p = pal(ui);
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+        logo(ui, rect);
+        if resp.on_hover_text("Show the sidebar").clicked() {
+            app.prefs.sidebar_open = true;
+        }
+        ui.add_space(2.0);
+        if rail_button(ui, icons::CARET_DOUBLE_RIGHT, "Show the sidebar", false).clicked() {
+            app.prefs.sidebar_open = true;
+        }
+        ui.add_space(4.0);
+        if rail_button(ui, icons::PLUS, "New request (Ctrl+N)", true).clicked() {
+            app.actions.push(Action::NewRequest(None));
+        }
+        let n = app.catalog.collections.len();
+        if rail_button(ui, icons::STACK, &format!("Collections ({n})"), false).clicked() {
+            app.prefs.sidebar_open = true;
+        }
+        let n = app.catalog.workflows.len();
+        if rail_button(ui, icons::FLOW, &format!("Workflows ({n})"), false).clicked() {
+            app.prefs.sidebar_open = true;
+        }
+        if rail_button(ui, icons::MAGNIFYING_GLASS, "Filter requests", false).clicked() {
+            app.prefs.sidebar_open = true;
+            app.focus_filter = true;
+        }
+        ui.add_space(2.0);
+        let r = ui.min_rect();
+        ui.painter().hline(r.shrink2(egui::vec2(8.0, 0.0)).x_range(), ui.cursor().top(), Stroke::new(1.0, p.border));
+        ui.add_space(4.0);
+        if rail_button(ui, icons::UPLOAD, "Import: Postman, OpenAPI, WSDL, catalogs or curl", false).clicked() {
+            app.actions.push(Action::ImportInto(None));
+        }
+        let export = rail_button(ui, icons::DOWNLOAD, "Export the whole catalog", false);
+        egui::Popup::menu(&export).show(|ui| {
+            ui.set_min_width(200.0);
+            ui.label(RichText::new("WHOLE CATALOG").size(11.0).color(p.faint));
+            if ui.button("Save .json.gz (compressed)").clicked() {
+                app.actions.push(Action::ExportCatalogGz);
+                ui.close();
+            }
+            if ui.button("Save .json (text)").clicked() {
+                app.actions.push(Action::ExportCatalogJson);
+                ui.close();
+            }
+        });
+        if rail_button(ui, icons::FOLDER_OPEN, "Open a collection folder", false).clicked() {
+            app.actions.push(Action::OpenFolder);
+        }
+    });
+    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        if rail_button(ui, icons::GEAR, "Settings", false).clicked() {
+            app.modal = Some(Modal::Settings);
+        }
+        if rail_button(ui, icons::GLOBE, "Environments", false).clicked() {
+            app.modal = Some(Modal::Environments { selected: None });
+        }
+    });
+}
+
+/// A square icon button for the folded sidebar, with its tooltip to the side.
+fn rail_button(ui: &mut Ui, icon: &str, tip: &str, accent: bool) -> egui::Response {
+    let p = pal(ui);
+    let size = egui::vec2(38.0, 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if accent {
+        if resp.hovered() {
+            p.accent.gamma_multiply(0.9)
+        } else {
+            p.accent
+        }
+    } else if resp.hovered() || resp.is_pointer_button_down_on() {
+        p.surface3
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+    let color = if accent {
+        p.accent_text
+    } else if resp.hovered() {
+        p.text
+    } else {
+        p.muted
+    };
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(19.0), color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
 /// A section heading with a "+" button; the returned response takes a context menu.
@@ -387,14 +498,16 @@ fn menu(ui: &mut Ui, kind: MenuKind, id: &str, acts: &mut Vec<Action>) {
             ui.separator();
             item(ui, &format!("{}  Import into this collection\u{2026}", icons::UPLOAD), Action::ImportInto(Some(id.clone())));
             if linked {
+                item(ui, &format!("{}  Folder & Git\u{2026}", icons::GIT_BRANCH), Action::CollectionFiles(id.clone()));
                 item(ui, &format!("{}  Reload from folder", icons::ARROWS_CLOCKWISE), Action::ReloadFolder(id.clone()));
                 item(ui, &format!("{}  Keep in the catalog instead", icons::FOLDER), Action::UnlinkFolder(id.clone()));
             } else {
-                item(ui, &format!("{}  Save as a folder of files\u{2026}", icons::FOLDER_OPEN), Action::LinkFolder(id.clone()));
+                item(ui, &format!("{}  Link to a folder of files\u{2026}", icons::FOLDER_OPEN), Action::LinkFolder(id.clone()));
             }
             ui.separator();
             item(ui, &format!("{}  Variables & auth", icons::GEAR), Action::CollectionSettings(id.clone()));
             item(ui, &format!("{}  Rename", icons::PENCIL), Action::Rename(id.clone()));
+            item(ui, &format!("{}  Duplicate collection", icons::COPY), Action::DuplicateCollection(id.clone()));
             item(ui, &format!("{}  Export (.json.gz)", icons::DOWNLOAD), Action::ExportCollectionGz(id.clone()));
             item(ui, &format!("{}  Export as Postman v2.1", icons::DOWNLOAD), Action::ExportCollectionPostman(id.clone()));
             ui.separator();
@@ -404,6 +517,7 @@ fn menu(ui: &mut Ui, kind: MenuKind, id: &str, acts: &mut Vec<Action>) {
             item(ui, &format!("{}  New request", icons::PLUS), Action::NewRequest(Some(id.clone())));
             item(ui, &format!("{}  New folder", icons::FOLDER), Action::NewFolder(id.clone()));
             item(ui, &format!("{}  Rename", icons::PENCIL), Action::Rename(id.clone()));
+            item(ui, &format!("{}  Duplicate folder", icons::COPY), Action::DuplicateFolder(id.clone()));
             ui.separator();
             danger(ui, &format!("{}  Delete folder", icons::TRASH), Action::AskDelete(id), acts);
         }

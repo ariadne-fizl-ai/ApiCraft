@@ -38,6 +38,14 @@ impl Transport for WebTransport {
     fn sleep(&self, ms: u32) -> LocalBoxFuture<'_, ()> {
         Box::pin(dom::sleep_ms(ms))
     }
+    fn run_command(&self, spec: apicraft_core::sources::CommandSpec) -> LocalBoxFuture<'_, Result<apicraft_core::sources::CommandOutput, String>> {
+        Box::pin(async move {
+            match &self.agent {
+                Some(base) => agent_json(base, "command", &spec).await,
+                None => Err("values from commands need the local agent (apicraft-agent) in the browser".to_string()),
+            }
+        })
+    }
     fn now_ms(&self) -> u64 {
         dom::now_ms()
     }
@@ -62,6 +70,22 @@ impl Transport for WebTransport {
                 }
             }
         })
+    }
+}
+
+/// POSTs JSON to one of the agent's endpoints and reads a JSON reply (or its
+/// `{"error"}` body).
+pub async fn agent_json<T: serde::de::DeserializeOwned>(base: &str, endpoint: &str, body: &impl serde::Serialize) -> Result<T, String> {
+    let body = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let resp = agent_fetch(&format!("{base}/__apicraft/{endpoint}"), "POST", Some(&body), "application/json", None).await?;
+    let bytes = response_bytes(&resp).await?;
+    if resp.status() == 200 {
+        serde_json::from_slice(&bytes).map_err(|e| format!("bad agent reply: {e}"))
+    } else {
+        match serde_json::from_slice::<ProxyError>(&bytes) {
+            Ok(e) => Err(e.error),
+            Err(_) => Err(format!("the agent returned {}: {}", resp.status(), String::from_utf8_lossy(&bytes))),
+        }
     }
 }
 

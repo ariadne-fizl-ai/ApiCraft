@@ -298,6 +298,25 @@ fn api_route(req: &Req, api: &str, cfg: &Config, cross_origin: bool) -> Resp {
                 Err(e) => Resp::text(400, &e),
             }
         }
+        // Commands for environment values, and git for collection folders:
+        // they run programs, so only for the agent's own page.
+        ("POST", "command") | ("POST", "git") if cross_origin => {
+            Resp::json(403, &ProxyError { error: "commands can only be run from the agent's own page".into() })
+        }
+        ("POST", "command") => match serde_json::from_slice::<apicraft_core::sources::CommandSpec>(&req.body) {
+            Ok(spec) => match crate::process::run(&spec) {
+                Ok(out) => Resp::json(200, &out),
+                Err(e) => Resp::json(502, &ProxyError { error: e }),
+            },
+            Err(e) => Resp::json(400, &ProxyError { error: format!("bad command request: {e}") }),
+        },
+        ("POST", "git") => match serde_json::from_slice::<apicraft_core::git::GitRequest>(&req.body) {
+            Ok(g) => match crate::git::run(&g) {
+                Ok(reply) => Resp::json(200, &reply),
+                Err(e) => Resp::json(502, &ProxyError { error: e }),
+            },
+            Err(e) => Resp::json(400, &ProxyError { error: format!("bad git request: {e}") }),
+        },
         _ => Resp::text(404, "unknown agent endpoint"),
     }
 }

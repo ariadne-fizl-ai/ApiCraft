@@ -221,6 +221,9 @@ pub struct Request {
     pub checks: Vec<Check>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Headers and body encoding worked out when the request is sent.
+    #[serde(default, skip_serializing_if = "SendOptions::is_default")]
+    pub send: SendOptions,
 }
 
 fn default_method() -> String {
@@ -248,6 +251,7 @@ impl Request {
             extract: Vec::new(),
             checks: Vec::new(),
             description: String::new(),
+            send: SendOptions::default(),
         };
         match protocol {
             Protocol::Rest => {}
@@ -278,6 +282,47 @@ impl Request {
             Protocol::OData => {}
         }
         r
+    }
+}
+
+/// How a request body is compressed before sending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    #[default]
+    None,
+    Gzip,
+    Deflate,
+}
+
+impl Compression {
+    pub const ALL: [Compression; 3] = [Compression::None, Compression::Gzip, Compression::Deflate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Compression::None => "Not compressed",
+            Compression::Gzip => "gzip",
+            Compression::Deflate => "deflate",
+        }
+    }
+}
+
+/// "Magic" headers, filled in at the moment a request is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SendOptions {
+    /// Adds `Content-Length` with the size of the body as sent.
+    pub content_length: bool,
+    /// Compresses the body and adds the matching `Content-Encoding`.
+    pub compress: Compression,
+    /// Asks for a compressed response (`Accept-Encoding: gzip, deflate`)
+    /// and unpacks what comes back.
+    pub accept_compressed: bool,
+}
+
+impl SendOptions {
+    pub fn is_default(&self) -> bool {
+        *self == SendOptions::default()
     }
 }
 
@@ -1074,11 +1119,52 @@ pub struct Environment {
     pub name: String,
     #[serde(default)]
     pub variables: Vec<KeyValue>,
+    /// Variables whose values come from running a command (a secrets
+    /// manager's CLI, say). Values are fetched when needed and only kept in
+    /// memory, never saved with the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<VarSource>,
 }
 
 impl Environment {
     pub fn new(name: impl Into<String>) -> Self {
-        Environment { id: new_id(), name: name.into(), variables: Vec::new() }
+        Environment { id: new_id(), name: name.into(), variables: Vec::new(), sources: Vec::new() }
+    }
+}
+
+/// Where a command-backed variable's value comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// Any command line; its output (trimmed) is the value.
+    #[default]
+    Command,
+    /// An item in Bitwarden, read with the Bitwarden CLI (`bw`).
+    Bitwarden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VarSource {
+    /// The variable it sets, used as `{{key}}`.
+    pub key: String,
+    #[serde(default)]
+    pub kind: SourceKind,
+    /// The command line (for [`SourceKind::Command`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    /// The Bitwarden item's name or id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub item: String,
+    /// password, username, totp, notes, uri, or the name of a custom field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub field: String,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+}
+
+impl VarSource {
+    pub fn new(kind: SourceKind) -> Self {
+        VarSource { key: String::new(), kind, command: String::new(), item: String::new(), field: "password".into(), enabled: true }
     }
 }
 
@@ -1219,6 +1305,33 @@ impl Catalog {
             }
         }
         None
+    }
+
+    /// Adds a copy of a whole collection after the original, with fresh ids
+    /// throughout. A copy of a folder-linked collection is kept in the catalog.
+    pub fn duplicate_collection(&mut self, id: &str) -> Option<String> {
+        let pos = self.collections.iter().position(|c| c.id == id)?;
+        let mut copy = self.collections[pos].clone();
+        copy.id = new_id();
+        copy.name = format!("{} (copy)", copy.name);
+        copy.directory = None;
+        reid_items(&mut copy.items);
+        let new = copy.id.clone();
+        self.collections.insert(pos + 1, copy);
+        Some(new)
+    }
+
+    /// Adds a copy of a folder and everything in it next to the original.
+    pub fn duplicate_folder(&mut self, id: &str) -> Option<String> {
+        let (container, index) = self.parent_of(id)?;
+        let Some(Item::Folder(f)) = self.find_item(id) else { return None };
+        let mut copy = f.clone();
+        copy.id = new_id();
+        copy.name = format!("{} (copy)", copy.name);
+        reid_items(&mut copy.items);
+        let new = copy.id.clone();
+        self.container_items_mut(&container)?.insert(index + 1, Item::Folder(copy));
+        Some(new)
     }
 
     /// The auth that applies to a request, and the id of whoever owns it
@@ -1402,6 +1515,19 @@ fn rename_in(items: &mut [Item], id: &str, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Gives every request and folder in a copied tree a new id.
+fn reid_items(items: &mut [Item]) {
+    for i in items {
+        match i {
+            Item::Request(r) => r.id = new_id(),
+            Item::Folder(f) => {
+                f.id = new_id();
+                reid_items(&mut f.items);
+            }
+        }
+    }
 }
 
 fn duplicate_in(items: &mut Vec<Item>, id: &str) -> Option<String> {

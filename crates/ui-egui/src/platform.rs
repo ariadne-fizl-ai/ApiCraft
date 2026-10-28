@@ -5,14 +5,17 @@
 //! traffic) reports back through an [`Inbox`]: a channel the UI drains every
 //! frame, which also asks egui to repaint.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use apicraft_core::auth::{self, TokenGrant, TokenResult};
 use apicraft_core::engine::{self, Outcome};
+use apicraft_core::git::{GitReply, GitRequest};
 use apicraft_core::http::Transport;
 use apicraft_core::model::{Catalog, Collection, OAuth2, Workflow};
+use apicraft_core::sources::{self, CommandOutput, CommandSpec};
 use apicraft_core::workflow::{self, RunSummary, StepReport};
 
 /// Events delivered to the UI thread.
@@ -70,8 +73,45 @@ pub enum Msg {
         catalog: Box<Catalog>,
         note: String,
     },
+    /// Values fetched for an environment's command-backed variables.
+    SourceValues {
+        env_id: String,
+        values: Vec<(String, String)>,
+        errors: Vec<String>,
+        /// Fetched on request (rather than before sending): say how it went.
+        announce: bool,
+    },
+    /// A command run for the UI itself finished (Bitwarden unlock, status, ...).
+    CommandDone {
+        purpose: CommandPurpose,
+        result: Result<CommandOutput, String>,
+    },
+    Git {
+        request: GitRequest,
+        result: Result<GitReply, String>,
+    },
+    /// Text read from the system clipboard for a Paste menu item.
+    Clipboard(String),
     /// Something about the platform changed (agent found, ...): just repaint.
     Refresh,
+}
+
+/// Why a [`Job::Command`] was run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandPurpose {
+    BitwardenUnlock,
+    BitwardenStatus,
+    BitwardenSync,
+}
+
+/// Command-backed environment values for a job: the ones fetched already,
+/// and what's needed to fetch the rest.
+#[derive(Debug, Clone, Default)]
+pub struct SourceCtx {
+    pub env_id: String,
+    pub known: HashMap<String, String>,
+    /// From `bw unlock`; empty when not unlocked here.
+    pub bw_session: String,
 }
 
 /// Why a collection folder is being picked or read.
@@ -129,22 +169,36 @@ impl Inbox {
 pub enum Job {
     Execute {
         catalog: Box<Catalog>,
+        sources: SourceCtx,
         request_id: String,
     },
     Workflow {
         catalog: Box<Catalog>,
+        sources: SourceCtx,
         workflow_id: String,
         stop: Arc<AtomicBool>,
     },
     /// List what an MCP server offers (tools, resources, prompts).
     McpDiscover {
         catalog: Box<Catalog>,
+        sources: SourceCtx,
         request_id: String,
     },
     /// Load a GraphQL endpoint's schema or an OData service's $metadata.
     FetchSchema {
         catalog: Box<Catalog>,
+        sources: SourceCtx,
         request_id: String,
+    },
+    /// Fetch (again) every command-backed value of the active environment.
+    FetchSources {
+        catalog: Box<Catalog>,
+        sources: SourceCtx,
+    },
+    /// Run a command for the UI (see [`CommandPurpose`]).
+    Command {
+        spec: CommandSpec,
+        purpose: CommandPurpose,
     },
     /// Download a definition (OpenAPI, WSDL, OData $metadata, Postman, catalog) to import;
     /// it arrives as `Msg::FileOpened` named by its URL.
@@ -171,11 +225,21 @@ pub struct CodeExchange {
 /// executor (a worker thread natively, `spawn_local` in the browser).
 pub async fn run_job(job: Job, transport: &dyn Transport, inbox: &Inbox) {
     match job {
-        Job::Execute { catalog, request_id } => {
+        Job::Execute { mut catalog, sources, request_id } => {
+            fill_sources(&mut catalog, &sources, false, transport, inbox).await;
             let outcome = engine::execute(&catalog, &request_id, &[], &[], &[], transport).await;
             inbox.post(Msg::Outcome { request_id, outcome: Box::new(outcome) });
         }
-        Job::Workflow { catalog, workflow_id, stop } => {
+        Job::FetchSources { mut catalog, sources } => {
+            let ctx = SourceCtx { known: HashMap::new(), ..sources };
+            fill_sources(&mut catalog, &ctx, true, transport, inbox).await;
+        }
+        Job::Command { spec, purpose } => {
+            let result = transport.run_command(spec).await;
+            inbox.post(Msg::CommandDone { purpose, result });
+        }
+        Job::Workflow { mut catalog, sources, workflow_id, stop } => {
+            fill_sources(&mut catalog, &sources, false, transport, inbox).await;
             let result = workflow::run(&catalog, &workflow_id, transport, &mut |rep| {
                 inbox.post(Msg::Step(Box::new(rep.clone())));
                 !stop.load(Ordering::Relaxed)
@@ -183,11 +247,13 @@ pub async fn run_job(job: Job, transport: &dyn Transport, inbox: &Inbox) {
             .await;
             inbox.post(Msg::WorkflowDone { workflow_id, result });
         }
-        Job::McpDiscover { catalog, request_id } => {
+        Job::McpDiscover { mut catalog, sources, request_id } => {
+            fill_sources(&mut catalog, &sources, false, transport, inbox).await;
             let result = engine::mcp_discover(&catalog, &request_id, transport).await;
             inbox.post(Msg::McpDiscovered { request_id, result });
         }
-        Job::FetchSchema { catalog, request_id } => {
+        Job::FetchSchema { mut catalog, sources, request_id } => {
+            fill_sources(&mut catalog, &sources, false, transport, inbox).await;
             let result = engine::fetch_schema(&catalog, &request_id, transport).await;
             inbox.post(Msg::SchemaFetched { request_id, result });
         }
@@ -225,6 +291,22 @@ pub async fn run_job(job: Job, transport: &dyn Transport, inbox: &Inbox) {
             };
             inbox.post(Msg::Token { owner, result });
         }
+    }
+}
+
+/// Puts the active environment's command-backed values into the job's copy
+/// of the catalog, running the commands for any not fetched yet, and reports
+/// new values back so they're kept (in memory) for next time.
+async fn fill_sources(catalog: &mut Catalog, ctx: &SourceCtx, announce: bool, transport: &dyn Transport, inbox: &Inbox) {
+    if sources::active_sources(catalog).is_empty() {
+        if announce {
+            inbox.toast("This environment has no values from commands", false);
+        }
+        return;
+    }
+    let r = sources::resolve(catalog, &ctx.known, &ctx.bw_session, transport).await;
+    if announce || !r.fetched.is_empty() || !r.errors.is_empty() {
+        inbox.post(Msg::SourceValues { env_id: ctx.env_id.clone(), values: r.fetched, errors: r.errors, announce });
     }
 }
 
@@ -288,6 +370,16 @@ pub trait Platform {
     /// arrives as `Msg::FolderLoaded`.
     fn load_folder(&self, path: String, purpose: FolderPurpose, inbox: Inbox) {
         inbox.post(Msg::FolderLoaded { path, purpose, result: Err("collection folders need the desktop app or the local agent".into()) });
+    }
+
+    /// Runs git for a collection folder; the reply arrives as `Msg::Git`.
+    fn git(&self, request: GitRequest, inbox: Inbox) {
+        inbox.post(Msg::Git { request, result: Err("Git needs the desktop app or the local agent (apicraft-agent)".into()) });
+    }
+
+    /// Reads text from the system clipboard; it arrives as `Msg::Clipboard`.
+    fn read_clipboard(&self, inbox: Inbox) {
+        inbox.toast("Use Ctrl+V to paste here", false);
     }
 
     /// Reads a file dropped on the window; it arrives as `Msg::FileOpened`.

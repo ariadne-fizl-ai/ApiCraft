@@ -166,7 +166,8 @@ pub fn outcome_view(ui: &mut Ui, o: &Outcome, tab: &mut RespTab, raw: &mut bool,
                 egui::Grid::new("captured").num_columns(3).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
                     for (scope, k, v) in &o.extracted {
                         ui.label(RichText::new(format!("{{{{{k}}}}}")).monospace().strong());
-                        ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+                        let r = ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+                        crate::textmenu::copy_menu(&r, v);
                         ui.label(RichText::new(if *scope == VarScope::Environment { "environment" } else { "runtime" }).color(p.muted).size(12.0));
                         ui.end_row();
                     }
@@ -184,8 +185,8 @@ pub fn checks_list(ui: &mut Ui, o: &Outcome, p: &Palette) {
     for c in &o.checks {
         ui.horizontal(|ui| {
             ui.label(RichText::new(if c.passed { icons::CHECK } else { icons::X }).color(if c.passed { p.ok_text } else { p.danger }));
-            ui.label(&c.label);
-            ui.label(RichText::new(&c.detail).color(p.muted).size(12.0));
+            ui.add(egui::Label::new(&c.label).wrap());
+            ui.add(egui::Label::new(RichText::new(&c.detail).color(p.muted).size(12.0)).wrap());
         });
     }
 }
@@ -198,7 +199,8 @@ pub fn sent_view(ui: &mut Ui, o: &Outcome, hl: &Highlighter, id: &str) {
     egui::ScrollArea::vertical().id_salt(("sent", id)).auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(&s.method).strong());
-            ui.add(egui::Label::new(RichText::new(&s.url).monospace()).wrap().selectable(true));
+            let r = ui.add(egui::Label::new(RichText::new(&s.url).monospace()).wrap().selectable(true));
+            crate::textmenu::copy_menu(&r, &s.url);
             if s.grpc {
                 chip(ui, "native gRPC");
             }
@@ -275,11 +277,12 @@ fn ws_panel(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
                             } else {
                                 e.text.clone()
                             };
-                            ui.add(
-                                egui::Label::new(RichText::new(text).monospace().color(if matches!(e.dir, WsDir::Info) { p.muted } else { p.text }))
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(&text).monospace().color(if matches!(e.dir, WsDir::Info) { p.muted } else { p.text }))
                                     .wrap()
                                     .selectable(true),
                             );
+                            crate::textmenu::copy_menu(&r, &text);
                         });
                     });
                 }

@@ -5,8 +5,10 @@
 
 pub mod connect;
 pub mod folders;
+pub mod git;
 pub mod mcp_client;
 pub mod mcp_server;
+pub mod process;
 pub mod server;
 pub mod upstream;
 
@@ -44,6 +46,10 @@ impl Transport for NativeTransport {
         messages: Vec<serde_json::Value>,
     ) -> LocalBoxFuture<'_, Result<apicraft_core::mcp::McpExchange, String>> {
         let r = mcp_client::session(launch, messages);
+        Box::pin(async move { r })
+    }
+    fn run_command(&self, spec: apicraft_core::sources::CommandSpec) -> LocalBoxFuture<'_, Result<apicraft_core::sources::CommandOutput, String>> {
+        let r = process::run(&spec);
         Box::pin(async move { r })
     }
 }

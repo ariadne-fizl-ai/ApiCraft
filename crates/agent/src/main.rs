@@ -234,6 +234,13 @@ fn cmd_run(mut args: Args) -> Result<bool, String> {
         cat.active_environment = Some(id);
     }
     let t = NativeTransport;
+    // Values from commands (secrets managers): fetched now, never saved.
+    let saved_envs = cat.environments.clone();
+    let session = std::env::var("BW_SESSION").unwrap_or_default();
+    let resolved = pollster::block_on(apicraft_core::sources::resolve(&mut cat, &Default::default(), &session, &t));
+    for e in &resolved.errors {
+        eprintln!("warning: {e}");
+    }
     let ok = match (wf, rq) {
         (Some(w), _) => {
             let id = find_by_name(cat.workflows.iter().map(|w| (w.id.as_str(), w.name.as_str())), &w)?;
@@ -281,6 +288,19 @@ fn cmd_run(mut args: Args) -> Result<bool, String> {
         _ => return Err("run needs --workflow NAME or --request NAME".into()),
     };
     if save {
+        // Keep values captured into environments, but not fetched secrets.
+        for (env, before) in cat.environments.iter_mut().zip(&saved_envs) {
+            for (k, _) in &resolved.fetched {
+                match before.variables.iter().find(|kv| &kv.key == k) {
+                    Some(orig) => {
+                        if let Some(kv) = env.variables.iter_mut().find(|kv| &kv.key == k) {
+                            *kv = orig.clone();
+                        }
+                    }
+                    None => env.variables.retain(|kv| &kv.key != k),
+                }
+            }
+        }
         save_catalog(&path, &cat)?;
         println!("Saved variables and tokens to {path}");
     }

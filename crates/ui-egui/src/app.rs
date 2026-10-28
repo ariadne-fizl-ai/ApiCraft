@@ -11,8 +11,9 @@ use apicraft_core::model::*;
 use apicraft_core::workflow::{RunSummary, StepReport};
 
 use crate::highlight::Highlighter;
-use crate::platform::{Inbox, Job, Msg, Platform, WsConn, WsEvent};
-use crate::{actions, theme, views};
+use crate::platform::{CommandPurpose, Inbox, Job, Msg, Platform, SourceCtx, WsConn, WsEvent};
+use crate::{actions, textmenu, theme, undo, views};
+use apicraft_core::git::{GitReply, GitRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -55,6 +56,11 @@ pub enum RespTab {
 pub enum Confirm {
     Delete(String),
     DeleteEnv(String),
+    /// Throw away uncommitted changes to these files in a collection folder.
+    GitDiscard {
+        dir: String,
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +81,33 @@ pub enum CollectionTab {
     General,
     Variables,
     Auth,
+    /// The folder it's kept in, and Git for that folder.
+    Files,
+}
+
+/// Git for one collection folder, as last read.
+#[derive(Default)]
+pub struct GitView {
+    /// `NotRepo` or `Status`, or why it couldn't be read.
+    pub status: Option<Result<GitReply, String>>,
+    /// What's running, if anything.
+    pub busy: Option<&'static str>,
+    /// Changed files left out of the next commit (by repository path).
+    pub unchecked: HashSet<String>,
+    pub message: String,
+    /// The file whose changes are shown, and the diff.
+    pub diff: Option<(String, String)>,
+}
+
+/// The Bitwarden CLI as this session knows it.
+#[derive(Default)]
+pub struct Bitwarden {
+    /// The session key from `bw unlock`, kept in memory only.
+    pub session: String,
+    /// What `bw status` last said (`unlocked`, `locked`, `unauthenticated`), and the account.
+    pub status: Option<(String, String)>,
+    pub password: String,
+    pub busy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,6 +183,8 @@ pub struct ApiCraftApp {
     pub(crate) sending: HashSet<String>,
     pub(crate) expanded: HashSet<String>,
     pub(crate) filter: String,
+    /// Focus the sidebar's filter box next frame.
+    pub(crate) focus_filter: bool,
     pub(crate) modal: Option<Modal>,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) ws: Option<WsSession>,
@@ -171,6 +206,17 @@ pub struct ApiCraftApp {
     /// Pretty-printed bodies, computed once when a response arrives.
     pub(crate) pretty: HashMap<String, String>,
     pub(crate) actions: Vec<actions::Action>,
+    pub(crate) history: undo::History,
+    text_menu: textmenu::TextMenu,
+    /// Values fetched for command-backed environment variables, by
+    /// environment id then variable. Memory only.
+    pub(crate) source_values: HashMap<String, HashMap<String, String>>,
+    /// The last error per `env id/variable`.
+    pub(crate) source_errors: HashMap<String, String>,
+    pub(crate) fetching_sources: bool,
+    pub(crate) bitwarden: Bitwarden,
+    /// Git per collection folder.
+    pub(crate) git: HashMap<String, GitView>,
     saved_hash: u64,
     last_save_check: f64,
     started: bool,
@@ -216,6 +262,13 @@ impl ApiCraftApp {
             inbox,
             rx,
             saved_hash: if fresh { 0 } else { catalog_hash(&catalog) },
+            history: undo::History::new(&catalog),
+            text_menu: textmenu::TextMenu::default(),
+            source_values: HashMap::new(),
+            source_errors: HashMap::new(),
+            fetching_sources: false,
+            bitwarden: Bitwarden::default(),
+            git: HashMap::new(),
             catalog,
             view: View::Welcome,
             req_tab: ReqTab::Params,
@@ -225,6 +278,7 @@ impl ApiCraftApp {
             sending: HashSet::new(),
             expanded: HashSet::new(),
             filter: String::new(),
+            focus_filter: false,
             modal: None,
             toasts: Vec::new(),
             ws: None,
@@ -322,12 +376,65 @@ impl ApiCraftApp {
         self.platform.spawn(job, self.inbox.clone());
     }
 
+    /// The command-backed values fetched so far for the active environment.
+    pub(crate) fn source_ctx(&self) -> SourceCtx {
+        let env_id = self.catalog.active_environment.clone().unwrap_or_default();
+        SourceCtx { known: self.source_values.get(&env_id).cloned().unwrap_or_default(), env_id, bw_session: self.bitwarden.session.clone() }
+    }
+
+    /// A copy of the catalog to send with, holding the command-backed values
+    /// fetched so far (the real catalog never holds them).
+    pub(crate) fn job_catalog(&self) -> Box<Catalog> {
+        let mut c = self.catalog.clone();
+        apicraft_core::sources::inject(&mut c, &self.source_ctx().known);
+        Box::new(c)
+    }
+
+    /// Runs git for a collection folder, after writing out any unsaved edits.
+    pub(crate) fn run_git(&mut self, request: GitRequest) {
+        if !matches!(request, GitRequest::Status { .. } | GitRequest::Diff { .. }) {
+            self.flush();
+        }
+        let view = self.git.entry(request.dir().to_string()).or_default();
+        view.busy = Some(request.verb());
+        self.platform.git(request, self.inbox.clone());
+    }
+
+    pub(crate) fn undo(&mut self) {
+        if self.history.undo(&mut self.catalog) {
+            self.after_history();
+        } else {
+            self.toast("Nothing to undo", false);
+        }
+    }
+
+    pub(crate) fn redo(&mut self) {
+        if self.history.redo(&mut self.catalog) {
+            self.after_history();
+        } else {
+            self.toast("Nothing to redo", false);
+        }
+    }
+
+    fn after_history(&mut self) {
+        // Typing in a field restored this way would otherwise carry on from stale text.
+        self.inbox.post(Msg::Refresh);
+        let gone = match &self.view {
+            View::Request(id) => self.catalog.find_request(id).is_none(),
+            View::Workflow(id) => self.catalog.workflow(id).is_none(),
+            View::Welcome => false,
+        };
+        if gone {
+            self.view = View::Welcome;
+        }
+    }
+
     pub(crate) fn next_ws_seq(&mut self) -> u32 {
         self.ws_seq += 1;
         self.ws_seq
     }
 
-    fn handle(&mut self, msg: Msg) {
+    fn handle(&mut self, msg: Msg, ctx: &egui::Context) {
         match msg {
             Msg::Outcome { request_id, outcome } => {
                 if !self.sending.remove(&request_id) {
@@ -426,7 +533,108 @@ impl ApiCraftApp {
                 }
                 self.toast(note, false);
             }
+            Msg::SourceValues { env_id, values, errors, announce } => {
+                self.fetching_sources = false;
+                let env = self.catalog.environments.iter().find(|e| e.id == env_id).map(|e| e.name.clone()).unwrap_or_default();
+                for (k, _) in &values {
+                    self.source_errors.remove(&format!("{env_id}/{k}"));
+                }
+                let n = values.len();
+                self.source_values.entry(env_id.clone()).or_default().extend(values);
+                for e in &errors {
+                    if let Some((key, why)) = e.strip_prefix("{{").and_then(|r| r.split_once("}}: ")) {
+                        self.source_errors.insert(format!("{env_id}/{key}"), why.to_string());
+                    }
+                }
+                if !errors.is_empty() {
+                    self.toast(format!("{env}: couldn't get {}", errors.join("; ")), true);
+                } else if announce {
+                    self.toast(format!("{env}: fetched {n} value(s)"), false);
+                }
+            }
+            Msg::CommandDone { purpose, result } => self.command_done(purpose, result),
+            Msg::Git { request, result } => self.git_done(request, result),
+            Msg::Clipboard(text) => self.text_menu.paste(ctx, text),
             Msg::Refresh => {}
+        }
+    }
+
+    fn command_done(&mut self, purpose: CommandPurpose, result: Result<apicraft_core::sources::CommandOutput, String>) {
+        use apicraft_core::sources;
+        self.bitwarden.busy = false;
+        let out = match result {
+            Ok(o) => o,
+            Err(e) => return self.toast(sources::explain_missing(&e), true),
+        };
+        match purpose {
+            CommandPurpose::BitwardenUnlock => {
+                self.bitwarden.password.clear();
+                if out.ok() && !out.stdout.trim().is_empty() {
+                    self.bitwarden.session = out.stdout.trim().to_string();
+                    self.bitwarden.status = Some(("unlocked".into(), self.bitwarden.status.take().map(|s| s.1).unwrap_or_default()));
+                    // Values that failed while locked can be fetched now.
+                    self.source_errors.clear();
+                    self.toast("Bitwarden unlocked for this session", false);
+                } else {
+                    self.toast(format!("Couldn't unlock Bitwarden: {}", out.failure()), true);
+                }
+            }
+            CommandPurpose::BitwardenStatus => match sources::parse_bitwarden_status(&out) {
+                Ok(s) => self.bitwarden.status = Some(s),
+                Err(e) => self.toast(format!("Bitwarden: {e}"), true),
+            },
+            CommandPurpose::BitwardenSync => {
+                if out.ok() {
+                    self.source_values.clear();
+                    self.toast("Bitwarden vault synced; values will be fetched again", false);
+                } else {
+                    self.toast(format!("Bitwarden sync failed: {}", out.failure()), true);
+                }
+            }
+        }
+    }
+
+    fn git_done(&mut self, request: GitRequest, result: Result<GitReply, String>) {
+        let dir = request.dir().to_string();
+        let view = self.git.entry(dir.clone()).or_default();
+        view.busy = None;
+        match (&request, result) {
+            (GitRequest::Status { .. }, r) => {
+                if let Ok(GitReply::Status(st)) = &r {
+                    // Forget choices about files that are no longer changed.
+                    view.unchecked.retain(|p| st.files.iter().any(|f| &f.path == p));
+                }
+                view.status = Some(r);
+            }
+            (_, Ok(GitReply::Diff { path, text })) => view.diff = Some((path, text)),
+            (_, Ok(GitReply::NotRepo)) => view.status = Some(Ok(GitReply::NotRepo)),
+            (_, Ok(GitReply::Done { message })) => {
+                if matches!(request, GitRequest::Commit { .. }) {
+                    view.message.clear();
+                    view.diff = None;
+                }
+                if !message.is_empty() {
+                    self.toast(message, false);
+                }
+                // Pulling or discarding changes the files: read them back in.
+                if matches!(request, GitRequest::Pull { .. } | GitRequest::Discard { .. }) {
+                    let ids: Vec<String> = self
+                        .catalog
+                        .collections
+                        .iter()
+                        .filter(|c| c.directory.as_deref().map(apicraft_core::git::normalise) == Some(apicraft_core::git::normalise(&dir)))
+                        .map(|c| c.id.clone())
+                        .collect();
+                    for id in ids {
+                        self.actions.push(actions::Action::ReloadFolder(id));
+                    }
+                }
+                self.run_git(GitRequest::Status { dir });
+            }
+            (_, Ok(GitReply::Status(st))) => view.status = Some(Ok(GitReply::Status(st))),
+            (_, Err(e)) => {
+                self.toast(format!("Git: {e}"), true);
+            }
         }
     }
 
@@ -464,6 +672,7 @@ impl ApiCraftApp {
             return;
         }
         self.last_save_check = self.now;
+        self.history.observe(&self.catalog, false);
         let h = catalog_hash(&self.catalog);
         if h != self.saved_hash {
             match self.platform.save_catalog(&self.catalog) {
@@ -506,6 +715,17 @@ impl ApiCraftApp {
         if ctx.input_mut(|i| i.consume_shortcut(&new)) {
             self.actions.push(actions::Action::NewRequest(None));
         }
+        // Text fields have their own undo; elsewhere, undo catalog edits.
+        if !ctx.egui_wants_keyboard_input() && self.modal.is_none() {
+            let undo = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+            let redo = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+            let redo_y = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+            if ctx.input_mut(|i| i.consume_shortcut(&redo) || i.consume_shortcut(&redo_y)) {
+                self.actions.push(actions::Action::Redo);
+            } else if ctx.input_mut(|i| i.consume_shortcut(&undo)) {
+                self.actions.push(actions::Action::Undo);
+            }
+        }
     }
 
     /// Draws one frame. Hosts call this from `eframe::App::ui`.
@@ -517,8 +737,9 @@ impl ApiCraftApp {
             self.platform.start(self.inbox.clone());
         }
         while let Ok(msg) = self.rx.try_recv() {
-            self.handle(msg);
+            self.handle(msg, &ctx);
         }
+        self.text_menu.begin(&ctx);
         if let Some(external) = self.platform.poll_external_catalog() {
             self.reload_external(external);
         }
@@ -530,6 +751,9 @@ impl ApiCraftApp {
         let pending = std::mem::take(&mut self.actions);
         for a in pending {
             actions::apply(self, a, &ctx);
+        }
+        if self.text_menu.end(&ctx) {
+            self.platform.read_clipboard(self.inbox.clone());
         }
         self.autosave();
         self.toasts.retain(|t| t.until > self.now);

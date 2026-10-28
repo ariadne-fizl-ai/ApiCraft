@@ -222,6 +222,7 @@ fn renders_every_view_tab_and_dialog() {
         Modal::Collection { id: col.clone(), tab: CollectionTab::General },
         Modal::Collection { id: col.clone(), tab: CollectionTab::Variables },
         Modal::Collection { id: col.clone(), tab: CollectionTab::Auth },
+        Modal::Collection { id: col.clone(), tab: CollectionTab::Files },
         Modal::Rename { id: col.clone(), value: "x".into() },
         Modal::Import { text: String::new(), target: None, url: String::new() },
         Modal::Confirm { message: "Delete?".into(), action: Confirm::Delete(col) },
@@ -233,6 +234,46 @@ fn renders_every_view_tab_and_dialog() {
         frame(&ctx, &mut app, 1400.0, 900.0);
     }
 
+    // Values from commands and Bitwarden in an environment.
+    let env = app.catalog.environments[0].id.clone();
+    app.catalog.active_environment = Some(env.clone());
+    let mut bw = VarSource::new(SourceKind::Bitwarden);
+    bw.key = "token".into();
+    bw.item = "My API".into();
+    app.catalog.environments[0].sources = vec![VarSource { key: "cmd".into(), command: "echo hi".into(), ..VarSource::new(SourceKind::Command) }, bw];
+    app.source_values.insert(env.clone(), [("cmd".to_string(), "hi".to_string())].into());
+    app.source_errors.insert(format!("{env}/token"), "Bitwarden is locked".into());
+    app.modal = Some(Modal::Environments { selected: Some(env) });
+    frame(&ctx, &mut app, 1400.0, 900.0);
+
+    // A collection kept in a folder, with Git changes and a diff open.
+    let col = app.catalog.collections[0].id.clone();
+    app.catalog.collections[0].directory = Some("C:/work/api".into());
+    let file = |p: &str, x: char, y: char| apicraft_core::git::GitFile { path: format!("api/{p}"), shown: p.into(), index: x, worktree: y };
+    let status = apicraft_core::git::GitStatus {
+        root: "C:/work".into(),
+        prefix: "api/".into(),
+        branch: "main".into(),
+        upstream: Some("origin/main".into()),
+        ahead: 1,
+        behind: 2,
+        files: vec![file("Get.request.json", ' ', 'M'), file("New.request.json", '?', '?')],
+        log: vec![apicraft_core::git::GitCommit { hash: "abc1234".into(), author: "Sam".into(), when: "2 days ago".into(), subject: "Add requests".into() }],
+    };
+    let view = app.git.entry("C:/work/api".into()).or_default();
+    view.status = Some(Ok(apicraft_core::git::GitReply::Status(status)));
+    view.diff = Some((
+        "api/Get.request.json".into(),
+        "@@ -1 +1 @@
+-{}
++{\"a\":1}"
+            .into(),
+    ));
+    app.modal = Some(Modal::Collection { id: col.clone(), tab: CollectionTab::Files });
+    frame(&ctx, &mut app, 1400.0, 900.0);
+    app.git.get_mut("C:/work/api").unwrap().status = Some(Ok(apicraft_core::git::GitReply::NotRepo));
+    frame(&ctx, &mut app, 1400.0, 900.0);
+
     // Dark theme, collapsed sidebar, welcome view.
     app.modal = None;
     app.prefs.theme = ThemeChoice::Dark;
@@ -242,4 +283,143 @@ fn renders_every_view_tab_and_dialog() {
     frame(&ctx, &mut app, 1400.0, 900.0);
     app.toast("hello", false);
     frame(&ctx, &mut app, 1400.0, 900.0);
+}
+
+/// The x position of the widget labelled `name` in the last frame.
+fn widget_x(ctx: &egui::Context, name: &str) -> f32 {
+    let mut found = None;
+    ctx.viewport(|v| {
+        let widgets = &v.prev_pass.widgets;
+        for (_, rects) in widgets.layers() {
+            for w in rects {
+                if found.is_none() && widgets.info(w.id).and_then(|i| i.label.as_deref()) == Some(name) {
+                    found = Some(w.rect.left());
+                }
+            }
+        }
+    });
+    found.unwrap_or_else(|| panic!("no widget labelled {name}"))
+}
+
+#[test]
+fn response_pane_keeps_its_width_across_tabs() {
+    let ctx = egui::Context::default();
+    let mut app = ApiCraftApp::new(&ctx, Box::new(FakePlatform), None, None);
+    ctx.all_styles_mut(|s| s.debug.show_interactive_widgets = true);
+    let id = app.catalog.all_requests()[0].1.id.clone();
+    app.open_request(&id);
+    // Panels remember the size of what they last showed: a short Checks
+    // tab used to shrink the pane, and a long header to stretch it.
+    let mut short = outcome_for(&app, &id, "{}", "application/json");
+    // Alerts fill the width, which would hide the problem.
+    short.warnings.clear();
+    let mut long = short.clone();
+    if let Some(r) = &mut long.response {
+        r.headers.push(("X-Long".into(), "x".repeat(600)));
+    }
+    long.checks[0].detail = "y".repeat(400);
+    for o in [short, long] {
+        app.outcomes.insert(id.clone(), o);
+        let mut xs = Vec::new();
+        for tab in [RespTab::Body, RespTab::Headers, RespTab::Checks, RespTab::Body, RespTab::Checks] {
+            app.resp_tab = tab;
+            frame(&ctx, &mut app, 1400.0, 900.0);
+            frame(&ctx, &mut app, 1400.0, 900.0);
+            xs.push(widget_x(&ctx, "Request"));
+        }
+        assert!(xs.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "the response pane moved between tabs: {xs:?}");
+    }
+}
+
+#[test]
+fn undo_brings_back_a_deleted_workflow_step() {
+    let ctx = egui::Context::default();
+    let mut app = ApiCraftApp::new(&ctx, Box::new(FakePlatform), None, None);
+    let before = app.catalog.workflows[0].steps.len();
+    app.catalog.workflows[0].steps.remove(0);
+    app.undo();
+    assert_eq!(app.catalog.workflows[0].steps.len(), before);
+    app.redo();
+    assert_eq!(app.catalog.workflows[0].steps.len(), before - 1);
+}
+
+#[test]
+fn duplicates_collections_and_folders_with_new_ids() {
+    let mut cat = crate::sample::catalog();
+    let col = cat.collections[0].clone();
+    let copy_id = cat.duplicate_collection(&col.id).unwrap();
+    let copy = cat.collection(&copy_id).unwrap();
+    assert_eq!(copy.name, format!("{} (copy)", col.name));
+    let ids = |c: &Collection| c.items.iter().map(|i| i.id().to_string()).collect::<Vec<_>>();
+    assert_eq!(copy.items.len(), col.items.len());
+    assert!(ids(copy).iter().all(|i| !ids(&col).contains(i)), "fresh ids");
+    let folder = col.items.iter().find(|i| matches!(i, Item::Folder(_))).unwrap().id().to_string();
+    let new_folder = cat.duplicate_folder(&folder).unwrap();
+    assert_eq!(cat.parent_of(&new_folder).map(|(c, _)| c), Some(col.id.clone()));
+}
+
+/// The centre of the last frame's widget matching `pick`.
+fn find_widget(ctx: &egui::Context, pick: impl Fn(&egui::WidgetInfo) -> bool) -> Option<egui::Pos2> {
+    let mut found = None;
+    ctx.viewport(|v| {
+        let widgets = &v.prev_pass.widgets;
+        for (_, rects) in widgets.layers() {
+            for w in rects {
+                if found.is_none() && widgets.info(w.id).is_some_and(&pick) {
+                    found = Some(w.rect.center());
+                }
+            }
+        }
+    });
+    found
+}
+
+fn click(ctx: &egui::Context, app: &mut ApiCraftApp, pos: egui::Pos2, button: egui::PointerButton) {
+    let ev = |pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() };
+    frame_with(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+    frame_with(ctx, app, vec![ev(true)]);
+    frame_with(ctx, app, vec![ev(false)]);
+    frame_with(ctx, app, Vec::new());
+    frame_with(ctx, app, Vec::new());
+}
+
+fn menu_item(ctx: &egui::Context, name: &str) -> egui::Pos2 {
+    find_widget(ctx, |i| i.label.as_deref().is_some_and(|l| l.contains(name))).unwrap_or_else(|| panic!("no menu item {name}"))
+}
+
+#[test]
+fn text_fields_have_a_working_context_menu() {
+    let ctx = egui::Context::default();
+    let mut app = ApiCraftApp::new(&ctx, Box::new(FakePlatform), None, None);
+    ctx.all_styles_mut(|s| s.debug.show_interactive_widgets = true);
+    app.filter = "basic".into();
+    for _ in 0..3 {
+        frame_with(&ctx, &mut app, Vec::new());
+    }
+    let field = find_widget(&ctx, |i| i.current_text_value.as_deref() == Some("basic")).expect("the filter field");
+    click(&ctx, &mut app, field, egui::PointerButton::Primary);
+    click(&ctx, &mut app, field, egui::PointerButton::Secondary);
+    click(&ctx, &mut app, menu_item(&ctx, "Select all"), egui::PointerButton::Primary);
+    click(&ctx, &mut app, field, egui::PointerButton::Secondary);
+    click(&ctx, &mut app, menu_item(&ctx, "Cut"), egui::PointerButton::Primary);
+    assert_eq!(app.filter, "", "Select all then Cut empties the field");
+    // Undo in the menu goes through the field's own undo.
+    click(&ctx, &mut app, field, egui::PointerButton::Secondary);
+    click(&ctx, &mut app, menu_item(&ctx, "Undo"), egui::PointerButton::Primary);
+    assert_eq!(app.filter, "basic");
+}
+
+#[test]
+fn sidebar_menus_offer_duplicate_and_git() {
+    let ctx = egui::Context::default();
+    let mut app = ApiCraftApp::new(&ctx, Box::new(FakePlatform), None, None);
+    ctx.all_styles_mut(|s| s.debug.show_interactive_widgets = true);
+    for _ in 0..3 {
+        frame_with(&ctx, &mut app, Vec::new());
+    }
+    let row = row_center(&ctx, "Examples");
+    click(&ctx, &mut app, row, egui::PointerButton::Secondary);
+    let before = app.catalog.collections.len();
+    click(&ctx, &mut app, menu_item(&ctx, "Duplicate collection"), egui::PointerButton::Primary);
+    assert_eq!(app.catalog.collections.len(), before + 1);
 }

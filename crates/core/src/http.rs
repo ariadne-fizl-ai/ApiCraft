@@ -106,6 +106,14 @@ pub trait Transport {
         let _ = (launch, messages);
         Box::pin(async { Err("stdio and SSE MCP servers need the desktop app or the local agent (Streamable HTTP works everywhere)".to_string()) })
     }
+
+    /// Runs a command on the host, for variables whose values come from a
+    /// command (see [`crate::sources`]). Only the desktop app and the local
+    /// agent can.
+    fn run_command(&self, spec: crate::sources::CommandSpec) -> LocalBoxFuture<'_, Result<crate::sources::CommandOutput, String>> {
+        let _ = spec;
+        Box::pin(async { Err("values from commands need the desktop app or the local agent".to_string()) })
+    }
 }
 
 mod b64 {

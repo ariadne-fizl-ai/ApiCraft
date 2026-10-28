@@ -187,6 +187,20 @@ impl Platform for DesktopPlatform {
         inbox.post(Msg::FolderLoaded { path, purpose, result: result.map(Box::new) });
     }
 
+    fn git(&self, request: apicraft_core::git::GitRequest, inbox: Inbox) {
+        std::thread::spawn(move || {
+            let result = apicraft_agent::git::run(&request);
+            inbox.post(Msg::Git { request, result });
+        });
+    }
+
+    fn read_clipboard(&self, inbox: Inbox) {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => inbox.post(Msg::Clipboard(text)),
+            Err(e) => inbox.toast(format!("Couldn't read the clipboard: {e}"), true),
+        }
+    }
+
     fn open_files(&self, inbox: Inbox) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("Catalogs, Postman, OpenAPI, WSDL, GraphQL, OData", &["json", "gz", "yaml", "yml", "wsdl", "xml", "edmx"])

@@ -199,6 +199,34 @@ impl Platform for WebPlatform {
         });
     }
 
+    fn git(&self, request: apicraft_core::git::GitRequest, inbox: Inbox) {
+        let Some(base) = self.state.agent_base() else {
+            return inbox.post(Msg::Git { request, result: Err("Git needs the local agent (apicraft-agent)".into()) });
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = net::agent_json(&base, "git", &request).await;
+            inbox.post(Msg::Git { request, result });
+        });
+    }
+
+    fn read_clipboard(&self, inbox: Inbox) {
+        // navigator.clipboard.readText(), which asks the user the first time.
+        let read = || -> Result<js_sys::Promise, JsValue> {
+            let clipboard = js_sys::Reflect::get(&dom::window().navigator(), &JsValue::from_str("clipboard"))?;
+            let f: js_sys::Function = js_sys::Reflect::get(&clipboard, &JsValue::from_str("readText"))?.dyn_into()?;
+            f.call0(&clipboard)?.dyn_into()
+        };
+        match read() {
+            Ok(promise) => wasm_bindgen_futures::spawn_local(async move {
+                match wasm_bindgen_futures::JsFuture::from(promise).await {
+                    Ok(v) => inbox.post(Msg::Clipboard(v.as_string().unwrap_or_default())),
+                    Err(_) => inbox.toast("The browser didn't allow reading the clipboard; use Ctrl+V", true),
+                }
+            }),
+            Err(_) => inbox.toast("This browser can't read the clipboard from a menu; use Ctrl+V", true),
+        }
+    }
+
     fn open_files(&self, inbox: Inbox) {
         wasm_bindgen_futures::spawn_local(async move {
             let Some(files) = rfd::AsyncFileDialog::new()

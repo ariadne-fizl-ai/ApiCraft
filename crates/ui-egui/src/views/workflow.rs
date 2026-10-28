@@ -77,7 +77,7 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
             .default_size(w * 0.45)
             .size_range(320.0..=w - 360.0)
             .frame(pane)
-            .show(ui, |ui| results(app, ui, id));
+            .show(ui, |ui| widgets::fixed_size(ui, |ui| results(app, ui, id)));
     } else {
         let h = ui.available_height();
         egui::Panel::bottom("wf-results-below")
@@ -85,7 +85,7 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
             .default_size(h * 0.45)
             .size_range(140.0..=h - 160.0)
             .frame(pane)
-            .show(ui, |ui| results(app, ui, id));
+            .show(ui, |ui| widgets::fixed_size(ui, |ui| results(app, ui, id)));
     }
     egui::CentralPanel::default().frame(pane).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| steps(app, ui, id));
@@ -154,7 +154,7 @@ fn steps(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
         })
         .unwrap_or_default();
 
-    let ApiCraftApp { catalog, expanded, actions, add_step, .. } = app;
+    let ApiCraftApp { catalog, expanded, actions, add_step, toasts, now, .. } = app;
     let requests: Vec<(String, String, Protocol)> =
         catalog.all_requests().into_iter().filter(|(_, r)| r.protocol != Protocol::WebSocket).map(|(l, r)| (r.id.clone(), l, r.protocol)).collect();
     let Some(w) = catalog.workflow_mut(id) else { return };
@@ -276,6 +276,11 @@ fn steps(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
         match d {
             0 => {
                 w.steps.remove(i);
+                toasts.push(crate::app::Toast {
+                    text: format!("Removed step {}. Press Ctrl+Z (or Undo at the top) to bring it back.", i + 1),
+                    error: false,
+                    until: *now + 5.0,
+                });
             }
             -1 => w.steps.swap(i, i - 1),
             _ => w.steps.swap(i, i + 1),

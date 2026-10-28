@@ -71,7 +71,7 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
             .default_size(w * 0.47)
             .size_range(340.0..=w - 360.0)
             .frame(pane)
-            .show(ui, |ui| response::show(app, ui, id));
+            .show(ui, |ui| widgets::fixed_size(ui, |ui| response::show(app, ui, id)));
     } else {
         let h = ui.available_height();
         egui::Panel::bottom("response-below")
@@ -79,7 +79,7 @@ pub fn show(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
             .default_size(h * 0.5)
             .size_range(160.0..=h - 160.0)
             .frame(pane)
-            .show(ui, |ui| response::show(app, ui, id));
+            .show(ui, |ui| widgets::fixed_size(ui, |ui| response::show(app, ui, id)));
     }
     egui::CentralPanel::default().frame(pane).show(ui, |ui| editor(app, ui, id));
 }
@@ -212,6 +212,60 @@ fn urlbar(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
     ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, p.border));
 }
 
+/// The "magic" headers worked out when the request is sent.
+fn auto_headers(ui: &mut Ui, o: &mut SendOptions, headers: &[KeyValue]) {
+    let p = pal(ui);
+    let mine = |name: &str| headers.iter().any(|h| h.enabled && h.key.trim().eq_ignore_ascii_case(name));
+    Frame::new().fill(p.surface2).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("Automatic headers").strong().size(12.5));
+        help(ui, "Worked out at the moment the request is sent.");
+        ui.add_space(2.0);
+        let mono = |t: &str| RichText::new(t).monospace();
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut o.content_length, mono("Content-Length"));
+            ui.label(RichText::new("the size of the body as sent (after compression)").size(12.0).color(p.muted));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut o.accept_compressed, mono("Accept-Encoding: gzip, deflate"));
+            ui.label(RichText::new("asks for a compressed response, and unpacks it").size(12.0).color(p.muted));
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut on = o.compress != Compression::None;
+            if ui.checkbox(&mut on, mono("Content-Encoding")).changed() {
+                o.compress = if on { Compression::Gzip } else { Compression::None };
+            }
+            ui.add_enabled_ui(on, |ui| {
+                egui::ComboBox::from_id_salt("compress").selected_text(if on { o.compress.label() } else { "gzip" }).width(90.0).show_ui(ui, |ui| {
+                    for c in [Compression::Gzip, Compression::Deflate] {
+                        ui.selectable_value(&mut o.compress, c, c.label());
+                    }
+                });
+            });
+            ui.label(RichText::new("compresses the body before sending").size(12.0).color(p.muted));
+        });
+        let clash: Vec<&str> =
+            [("Content-Length", o.content_length), ("Accept-Encoding", o.accept_compressed), ("Content-Encoding", o.compress != Compression::None)]
+                .into_iter()
+                .filter(|(h, on)| *on && mine(h))
+                .map(|(h, _)| h)
+                .collect();
+        if !clash.is_empty() {
+            let note = if clash.contains(&"Accept-Encoding") && clash.len() == 1 {
+                "Your own Accept-Encoding header below is sent instead of the automatic one.".to_string()
+            } else {
+                format!("The automatic value replaces your own {} header below.", clash.join(" and "))
+            };
+            ui.label(RichText::new(note).size(12.0).color(p.warn_text));
+        }
+    });
+    ui.add_space(8.0);
+}
+
+fn auto_count(o: &SendOptions) -> usize {
+    [o.content_length, o.accept_compressed, o.compress != Compression::None].iter().filter(|b| **b).count()
+}
+
 fn count(kvs: &[KeyValue]) -> usize {
     kvs.iter().filter(|k| k.enabled && !k.key.is_empty()).count()
 }
@@ -236,7 +290,7 @@ fn editor(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
     match r.protocol {
         Protocol::Rest => {
             items.push((ReqTab::Params, "Params".into(), count(&r.params)));
-            items.push((ReqTab::Headers, "Headers".into(), count(&r.headers)));
+            items.push((ReqTab::Headers, "Headers".into(), count(&r.headers) + auto_count(&r.send)));
             items.push((ReqTab::Body, "Body".into(), 0));
         }
         Protocol::Soap => {
@@ -300,6 +354,9 @@ fn editor(app: &mut ApiCraftApp, ui: &mut Ui, id: &str) {
                 }
             }
             ReqTab::Headers => {
+                if matches!(r.protocol, Protocol::Rest | Protocol::Soap | Protocol::GraphQl | Protocol::OData) {
+                    auto_headers(ui, &mut r.send, &r.headers);
+                }
                 kv_table(ui, "headers", &mut r.headers, "Header", "value");
                 help(
                     ui,

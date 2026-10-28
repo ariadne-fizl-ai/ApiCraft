@@ -75,6 +75,12 @@ fn request_plan(catalog: &Catalog, request_id: &str, vars: &Vars, now_ms: u64, t
     }
     let mut plan = plan(p, &auth, now_ms, target)?;
     connect_options(&mut plan, &connect, target);
+    if req.send.accept_compressed && target == Target::Curl {
+        plan.curl_auth.push("--compressed".into());
+    }
+    if req.send.compress != crate::model::Compression::None {
+        plan.notes.push(format!("Fizl ApiCraft sends this body {}-compressed; this command sends it as plain text.", req.send.compress.label()));
+    }
     Ok((plan, mcp))
 }
 

@@ -51,7 +51,7 @@ pub fn status_button(ui: &mut Ui, dot: Color32, label: &str) -> egui::Response {
 
 pub fn icon_button(ui: &mut Ui, icon: &str, tip: &str) -> egui::Response {
     let p = pal(ui);
-    ui.add(egui::Button::new(RichText::new(icon).color(p.muted)).frame(false)).on_hover_text(tip)
+    ui.add(egui::Button::new(RichText::new(icon).color(p.muted).size(16.0)).frame(false).min_size(Vec2::new(24.0, 24.0))).on_hover_text(tip)
 }
 
 pub fn pill(ui: &mut Ui, text: impl Into<String>, fill: Color32, color: Color32) -> egui::Response {
@@ -605,6 +605,20 @@ pub fn code_view(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, text: 
     });
 }
 
+/// Lays out `add` in exactly the space available and clips whatever doesn't
+/// fit, rather than letting wide content (a long header, an unwrapped line)
+/// push the panel wider. Resizable panels remember their size from their
+/// content, so without this they jump around as tabs change.
+pub fn fixed_size<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    child.shrink_clip_rect(rect);
+    child.set_max_width(rect.width());
+    let r = add(&mut child);
+    ui.allocate_rect(rect, egui::Sense::hover());
+    r
+}
+
 /// A two-column table of header-like pairs.
 pub fn pairs_table(ui: &mut Ui, id: &str, pairs: &[(String, String)]) {
     let p = pal(ui);
@@ -614,8 +628,30 @@ pub fn pairs_table(ui: &mut Ui, id: &str, pairs: &[(String, String)]) {
     }
     egui::Grid::new(id).num_columns(2).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
         for (k, v) in pairs {
-            ui.label(RichText::new(k).monospace().strong().color(p.text2));
-            ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+            let rk = ui.add(egui::Label::new(RichText::new(k).monospace().strong().color(p.text2)).sense(egui::Sense::click()));
+            let rv = ui.add(egui::Label::new(RichText::new(v).monospace()).wrap().selectable(true));
+            for r in [rk, rv] {
+                r.context_menu(|ui| {
+                    ui.set_min_width(180.0);
+                    if ui.button(format!("{}  Copy value", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(v.clone());
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Copy name", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(k.clone());
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Copy as \u{201c}{k}: \u{2026}\u{201d}", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(format!("{k}: {v}"));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}  Copy all", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(pairs.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"));
+                        ui.close();
+                    }
+                });
+            }
             ui.end_row();
         }
     });

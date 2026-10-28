@@ -2,7 +2,8 @@
 
 use apicraft_core::codegen::{self, Target};
 use apicraft_core::format::human_size;
-use apicraft_core::model::ProxyMode;
+use apicraft_core::git::{GitReply, GitRequest};
+use apicraft_core::model::{ProxyMode, SourceKind, VarSource};
 use egui::{Align, Layout, RichText, TextEdit, Ui};
 
 use super::response;
@@ -74,7 +75,7 @@ fn code(app: &mut ApiCraftApp, ui: &mut Ui, request_id: &str, curl: bool) {
     }
     ui.add_space(6.0);
     let target = if is_curl { Target::Curl } else { Target::PowerShell };
-    let code = codegen::generate(&app.catalog, request_id, app.platform.now_ms(), target).unwrap_or_else(|e| format!("# {e}"));
+    let code = codegen::generate(&app.job_catalog(), request_id, app.platform.now_ms(), target).unwrap_or_else(|e| format!("# {e}"));
     egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| widgets::code_view(ui, "code-out", &code, Lang::Plain, &app.highlighter));
     help(ui, "Variables, params and auth are applied, so this runs the same request as Send.");
     foot(ui, |ui| {
@@ -119,11 +120,22 @@ fn environments(app: &mut ApiCraftApp, ui: &mut Ui, selected: Option<String>) {
                 return;
             };
             let active = app.catalog.active_environment.as_deref() == Some(&id);
-            let Some(e) = app.catalog.environments.iter_mut().find(|e| e.id == id) else { return };
+            let ApiCraftApp { catalog, source_values, source_errors, bitwarden, actions, fetching_sources, .. } = app;
+            let Some(e) = catalog.environments.iter_mut().find(|e| e.id == id) else { return };
             ui.label(RichText::new("Name").strong());
             ui.add(TextEdit::singleline(&mut e.name).desired_width(f32::INFINITY));
             ui.add_space(6.0);
-            egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| kv_table(ui, &format!("env-{id}"), &mut e.variables, "variable", "value"));
+            let room = (ui.ctx().content_rect().height() - 280.0).max(340.0);
+            egui::ScrollArea::vertical().max_height(room).show(ui, |ui| {
+                kv_table(ui, &format!("env-{id}"), &mut e.variables, "variable", "value");
+                ui.add_space(12.0);
+                let known = source_values.get(&id);
+                sources_editor(ui, &id, &mut e.sources, known, source_errors, active, *fetching_sources, actions);
+                if e.sources.iter().any(|s| s.kind == SourceKind::Bitwarden) {
+                    ui.add_space(8.0);
+                    bitwarden_panel(ui, bitwarden, actions);
+                }
+            });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if !active && accent_button(ui, "Make active").clicked() {
@@ -140,6 +152,163 @@ fn environments(app: &mut ApiCraftApp, ui: &mut Ui, selected: Option<String>) {
                 });
             });
         });
+    });
+}
+
+/// Variables whose values come from running a command, or from Bitwarden.
+#[allow(clippy::too_many_arguments)]
+fn sources_editor(
+    ui: &mut Ui,
+    env_id: &str,
+    sources: &mut Vec<VarSource>,
+    known: Option<&std::collections::HashMap<String, String>>,
+    errors: &std::collections::HashMap<String, String>,
+    active: bool,
+    fetching: bool,
+    actions: &mut Vec<Action>,
+) {
+    let p = pal(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}  Values from commands", icons::TERMINAL_WINDOW)).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if !sources.is_empty() {
+                let b = ui.add_enabled(active && !fetching, egui::Button::new(format!("{} Fetch now", icons::ARROWS_CLOCKWISE)));
+                let b = if active {
+                    b.on_hover_text("Run every command again")
+                } else {
+                    b.on_disabled_hover_text("Make this environment active to fetch its values")
+                };
+                if b.clicked() {
+                    actions.push(Action::FetchSources);
+                }
+                if fetching {
+                    ui.spinner();
+                }
+            }
+        });
+    });
+    help(
+        ui,
+        "Each value is fetched by running a command (or reading Bitwarden) the first time a request needs it, then kept in memory for this session. Fetched values are never saved, and override variables of the same name above.",
+    );
+    ui.add_space(4.0);
+    let mut remove = None;
+    let fixed = 22.0 + 110.0 + 100.0 + 22.0 + 24.0 + 5.0 * 8.0;
+    let wide = (ui.available_width() - fixed).max(160.0);
+    for (i, s) in sources.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_sized([22.0, 24.0], egui::Checkbox::without_text(&mut s.enabled)).on_hover_text("Enabled");
+            ui.add(TextEdit::singleline(&mut s.key).id_salt((env_id, i, "sk")).hint_text("variable").desired_width(110.0).font(egui::TextStyle::Monospace));
+            egui::ComboBox::from_id_salt((env_id, i, "skind"))
+                .selected_text(match s.kind {
+                    SourceKind::Command => "Command",
+                    SourceKind::Bitwarden => "Bitwarden",
+                })
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.kind, SourceKind::Command, "Command");
+                    ui.selectable_value(&mut s.kind, SourceKind::Bitwarden, "Bitwarden");
+                });
+            match s.kind {
+                SourceKind::Command => {
+                    ui.add(
+                        TextEdit::singleline(&mut s.command)
+                            .id_salt((env_id, i, "scmd"))
+                            .hint_text("op read op://vault/item/field   or   az account get-access-token --query accessToken -o tsv")
+                            .desired_width(wide)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                }
+                SourceKind::Bitwarden => {
+                    // The field picker's arrow and padding sit outside its width.
+                    let fw = 84.0;
+                    let w = (wide - fw - ui.spacing().item_spacing.x - 2.0 * ui.spacing().button_padding.x - ui.spacing().icon_width).max(80.0);
+                    ui.add(TextEdit::singleline(&mut s.item).id_salt((env_id, i, "sitem")).hint_text("item name or id").desired_width(w));
+                    egui::ComboBox::from_id_salt((env_id, i, "sfield")).selected_text(&s.field).width(fw).show_ui(ui, |ui| {
+                        for f in apicraft_core::sources::BITWARDEN_FIELDS {
+                            ui.selectable_value(&mut s.field, f.to_string(), f);
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("or a custom field's name:").size(11.5).color(p.faint));
+                        ui.add(TextEdit::singleline(&mut s.field).desired_width(160.0));
+                    });
+                }
+            }
+            let key = s.key.trim().to_string();
+            let (icon, color, tip) = if let Some(err) = errors.get(&format!("{env_id}/{key}")) {
+                (icons::WARNING, p.err_text, format!("Couldn't fetch: {err}"))
+            } else if let Some(v) = known.and_then(|k| k.get(&key)) {
+                (icons::CHECK, p.ok_text, format!("Fetched: {} characters, kept in memory only", v.chars().count()))
+            } else {
+                ("\u{2013}", p.faint, "Not fetched yet: fetched when a request first uses it".to_string())
+            };
+            ui.add_sized([22.0, 24.0], egui::Label::new(RichText::new(icon).color(color))).on_hover_text(tip);
+            if widgets::icon_button(ui, icons::X, "Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        sources.remove(i);
+    }
+    ui.horizontal(|ui| {
+        if ui.button(format!("{} Add a command", icons::TERMINAL_WINDOW)).clicked() {
+            sources.push(VarSource::new(SourceKind::Command));
+        }
+        if ui.button(format!("{} Add a Bitwarden secret", icons::LOCK_KEY)).clicked() {
+            sources.push(VarSource::new(SourceKind::Bitwarden));
+        }
+    });
+    if sources.iter().any(|s| s.kind == SourceKind::Command) {
+        help(ui, "Commands run in the system shell (cmd on Windows, sh elsewhere) on this computer; the output, trimmed, is the value.");
+    }
+}
+
+/// Unlocking the Bitwarden CLI for this session.
+fn bitwarden_panel(ui: &mut Ui, bw: &mut crate::app::Bitwarden, actions: &mut Vec<Action>) {
+    let p = pal(ui);
+    egui::Frame::new().fill(p.surface2).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{}  Bitwarden", icons::LOCK_KEY)).strong());
+            let (text, color) = match &bw.status {
+                _ if !bw.session.is_empty() => ("unlocked for this session".to_string(), p.ok_text),
+                Some((s, email)) if s == "unlocked" => (format!("unlocked{}", if email.is_empty() { String::new() } else { format!(" ({email})") }), p.ok_text),
+                Some((s, email)) if s == "locked" => (format!("locked{}", if email.is_empty() { String::new() } else { format!(" ({email})") }), p.warn_text),
+                Some((s, _)) if s == "unauthenticated" => ("not logged in: run `bw login` in a terminal once".to_string(), p.err_text),
+                Some((s, _)) => (s.clone(), p.muted),
+                None => ("status not checked".to_string(), p.muted),
+            };
+            ui.label(RichText::new(text).size(12.5).color(color));
+            if bw.busy {
+                ui.spinner();
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !bw.session.is_empty() && ui.button(format!("{} Lock", icons::LOCK_KEY)).on_hover_text("Forget the session key and fetched values").clicked() {
+                    actions.push(Action::BitwardenLock);
+                }
+                if ui.add_enabled(!bw.busy, egui::Button::new(format!("{} Sync", icons::CLOUD_ARROW_DOWN))).on_hover_text("bw sync: get the latest vault").clicked() {
+                    actions.push(Action::BitwardenSync);
+                }
+                if ui.add_enabled(!bw.busy, egui::Button::new("Check")).on_hover_text("bw status").clicked() {
+                    actions.push(Action::BitwardenStatus);
+                }
+            });
+        });
+        if bw.session.is_empty() {
+            ui.horizontal(|ui| {
+                let r = ui.add(TextEdit::singleline(&mut bw.password).password(true).hint_text("master password").desired_width(220.0));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(!bw.busy && !bw.password.is_empty(), egui::Button::new(format!("{} Unlock", icons::LOCK_OPEN))).clicked() || (enter && !bw.password.is_empty())
+                {
+                    actions.push(Action::BitwardenUnlock);
+                }
+            });
+            help(
+                ui,
+                "Uses the Bitwarden CLI (bw), logged in once with `bw login`. Unlocking runs `bw unlock`; the session key stays in memory and the password is never stored. Skip this if BW_SESSION is already set where the app runs.",
+            );
+        }
     });
 }
 
@@ -162,12 +331,36 @@ fn collection(app: &mut ApiCraftApp, ui: &mut Ui, id: &str, tab: CollectionTab) 
     let name = app.catalog.collection(id).map(|c| c.name.clone()).unwrap_or_default();
     head(app, ui, &name);
     let mut t = tab;
+    let dir = app.catalog.collection(id).and_then(|c| c.directory.clone());
+    let changed = dir.as_ref().and_then(|d| app.git.get(d)).and_then(|g| match &g.status {
+        Some(Ok(GitReply::Status(st))) => Some(st.files.len()),
+        _ => None,
+    });
     if widgets::tabs(
         ui,
         &mut t,
-        &[(CollectionTab::General, "General".into(), 0), (CollectionTab::Variables, "Variables".into(), 0), (CollectionTab::Auth, "Auth".into(), 0)],
+        &[
+            (CollectionTab::General, "General".into(), 0),
+            (CollectionTab::Variables, "Variables".into(), 0),
+            (CollectionTab::Auth, "Auth".into(), 0),
+            (CollectionTab::Files, "Folder & Git".into(), changed.unwrap_or(0)),
+        ],
     ) {
+        if t == CollectionTab::Files {
+            if let Some(dir) = &dir {
+                app.actions.push(Action::Git(GitRequest::Status { dir: dir.clone() }));
+            }
+        }
         app.modal = Some(Modal::Collection { id: id.to_string(), tab: t });
+    }
+    if t == CollectionTab::Files {
+        files_tab(app, ui, id, dir);
+        foot(ui, |ui| {
+            if accent_button(ui, "Done").clicked() {
+                app.modal = None;
+            }
+        });
+        return;
     }
     let native = app.platform.native_grpc();
     let default_redirect = app.platform.default_redirect_uri();
@@ -194,12 +387,238 @@ fn collection(app: &mut ApiCraftApp, ui: &mut Ui, id: &str, tab: CollectionTab) 
             let mut ignore = None;
             widgets::auth_editor(ui, &mut c.auth, &cx, actions, &mut ignore);
         }
+        CollectionTab::Files => {}
     });
     foot(ui, |ui| {
         if accent_button(ui, "Done").clicked() {
             app.modal = None;
         }
     });
+}
+
+/// Where the collection is kept on disk, and Git for that folder.
+fn files_tab(app: &mut ApiCraftApp, ui: &mut Ui, id: &str, dir: Option<String>) {
+    let p = pal(ui);
+    let Some(dir) = dir else {
+        help(
+            ui,
+            "This collection is kept inside the app's catalog. Link it to a folder to keep it as one text file per request and workflow instead, ready for Git: changes you make here are written to the files, and edits made to the files (by hand, or by a git pull) are picked up.",
+        );
+        ui.add_space(8.0);
+        if accent_button(ui, format!("{} Link to a folder\u{2026}", icons::FOLDER_OPEN)).clicked() {
+            app.actions.push(Action::LinkFolder(id.to_string()));
+        }
+        help(ui, "Choose an empty folder, or one that already holds this collection. If it's inside a Git repository, its changes can be committed from here.");
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icons::FOLDER_OPEN).color(p.muted));
+        let r = ui.add(egui::Label::new(RichText::new(&dir).monospace()).truncate().selectable(true));
+        crate::textmenu::copy_menu(&r, &dir);
+    });
+    ui.horizontal(|ui| {
+        if ui.button(format!("{} Reload from folder", icons::ARROWS_CLOCKWISE)).clicked() {
+            app.actions.push(Action::ReloadFolder(id.to_string()));
+        }
+        if ui.button(format!("{} Link to another folder\u{2026}", icons::FOLDER_OPEN)).clicked() {
+            app.actions.push(Action::LinkFolder(id.to_string()));
+        }
+        if ui.button(format!("{} Keep in the catalog instead", icons::LINK_BREAK)).on_hover_text("The files stay where they are").clicked() {
+            app.actions.push(Action::UnlinkFolder(id.to_string()));
+        }
+    });
+    ui.add_space(6.0);
+    ui.separator();
+    let view = app.git.entry(dir.clone()).or_default();
+    let busy = view.busy;
+    if view.status.is_none() && busy.is_none() {
+        app.actions.push(Action::Git(GitRequest::Status { dir: dir.clone() }));
+    }
+    let mut acts: Vec<Action> = Vec::new();
+    let mut confirm = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}  Git", icons::GIT_BRANCH)).strong());
+        if let Some(what) = busy {
+            ui.spinner();
+            ui.label(RichText::new(format!("{what}\u{2026}")).size(12.5).color(p.muted));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.add_enabled(busy.is_none(), egui::Button::new(format!("{} Refresh", icons::ARROWS_CLOCKWISE))).clicked() {
+                acts.push(Action::Git(GitRequest::Status { dir: dir.clone() }));
+            }
+        });
+    });
+    match &view.status {
+        None => {}
+        Some(Err(e)) => alert(ui, AlertKind::Error, e),
+        Some(Ok(GitReply::NotRepo)) => {
+            help(ui, "This folder isn't in a Git repository.");
+            if ui.add_enabled(busy.is_none(), egui::Button::new(format!("{} Create a repository here", icons::GIT_BRANCH))).clicked() {
+                acts.push(Action::Git(GitRequest::Init { dir: dir.clone() }));
+            }
+        }
+        Some(Ok(GitReply::Status(st))) => {
+            ui.horizontal_wrapped(|ui| {
+                widgets::chip(ui, format!("{} {}", icons::GIT_BRANCH, if st.branch.is_empty() { "(no branch)" } else { &st.branch }));
+                match &st.upstream {
+                    Some(u) => {
+                        ui.label(RichText::new(format!("tracking {u}")).size(12.0).color(p.muted));
+                        if st.ahead > 0 {
+                            widgets::pill(ui, format!("{} {} to push", icons::ARROW_UP, st.ahead), p.accent_soft, p.accent);
+                        }
+                        if st.behind > 0 {
+                            widgets::pill(ui, format!("{} {} to pull", icons::ARROW_DOWN, st.behind), p.warn_bg, p.warn_text);
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("no upstream branch").size(12.0).color(p.faint));
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(busy.is_none(), egui::Button::new(format!("{} Push", icons::CLOUD_ARROW_UP))).clicked() {
+                        acts.push(Action::Git(GitRequest::Push { dir: dir.clone() }));
+                    }
+                    if ui.add_enabled(busy.is_none() && st.upstream.is_some(), egui::Button::new(format!("{} Pull", icons::CLOUD_ARROW_DOWN))).clicked() {
+                        acts.push(Action::Git(GitRequest::Pull { dir: dir.clone() }));
+                    }
+                });
+            });
+            ui.label(RichText::new(format!("Repository: {}", st.root)).size(11.5).color(p.faint));
+            ui.add_space(6.0);
+            if st.files.is_empty() {
+                ui.label(RichText::new(format!("{} No changes in this folder.", icons::CHECK)).color(p.ok_text));
+            } else {
+                let included = st.files.iter().filter(|f| !view.unchecked.contains(&f.path)).count();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Changes  {}", st.files.len())).strong().size(12.5));
+                    let mut all = included == st.files.len();
+                    if ui.checkbox(&mut all, "all").changed() {
+                        if all {
+                            view.unchecked.clear();
+                        } else {
+                            view.unchecked = st.files.iter().map(|f| f.path.clone()).collect();
+                        }
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("git-files").max_height(150.0).show(ui, |ui| {
+                    for f in &st.files {
+                        ui.horizontal(|ui| {
+                            let mut on = !view.unchecked.contains(&f.path);
+                            if ui.add(egui::Checkbox::without_text(&mut on)).on_hover_text("Include in the commit").changed() {
+                                if on {
+                                    view.unchecked.remove(&f.path);
+                                } else {
+                                    view.unchecked.insert(f.path.clone());
+                                }
+                            }
+                            let color = match f.letter() {
+                                'U' | 'A' => p.ok_text,
+                                'D' | '!' => p.err_text,
+                                _ => p.warn_text,
+                            };
+                            ui.label(RichText::new(f.letter().to_string()).monospace().strong().color(color)).on_hover_text(f.label());
+                            let shown = view.diff.as_ref().is_some_and(|(d, _)| d == &f.path);
+                            let name = RichText::new(&f.shown).monospace().size(12.5);
+                            if ui.add(egui::Button::selectable(shown, name)).on_hover_text("Show the changes").clicked() {
+                                if shown {
+                                    view.diff = None;
+                                } else {
+                                    acts.push(Action::Git(GitRequest::Diff { dir: dir.clone(), path: f.path.clone() }));
+                                }
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::icon_button(ui, icons::ARROW_COUNTER_CLOCKWISE, "Discard the changes to this file").clicked() {
+                                    confirm = Some(vec![f.path.clone()]);
+                                }
+                            });
+                        });
+                    }
+                });
+                if let Some((path, text)) = &view.diff {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("{}  {}", icons::GIT_DIFF, path.strip_prefix(&st.prefix).unwrap_or(path))).size(12.0).color(p.muted));
+                    egui::Frame::new().fill(p.surface2).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(6).inner_margin(egui::Margin::same(8)).show(
+                        ui,
+                        |ui| {
+                            egui::ScrollArea::both().id_salt("git-diff").max_height(200.0).auto_shrink([false, true]).show(ui, |ui| {
+                                diff_view(ui, text);
+                            });
+                        },
+                    );
+                }
+                ui.add_space(6.0);
+                ui.add(
+                    TextEdit::multiline(&mut view.message)
+                        .hint_text("Commit message: what changed in these requests?")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    let can = busy.is_none() && included > 0 && !view.message.trim().is_empty();
+                    let label = format!("{} Commit {included} file{}", icons::GIT_COMMIT, if included == 1 { "" } else { "s" });
+                    let b = ui.add_enabled(
+                        can,
+                        egui::Button::new(RichText::new(label).color(if can { p.accent_text } else { p.muted })).fill(if can { p.accent } else { p.surface3 }),
+                    );
+                    if b.on_disabled_hover_text("Choose files and write a message").clicked() {
+                        let paths = st.files.iter().filter(|f| !view.unchecked.contains(&f.path)).map(|f| f.path.clone()).collect();
+                        acts.push(Action::Git(GitRequest::Commit { dir: dir.clone(), message: view.message.trim().to_string(), paths }));
+                    }
+                    if included > 0
+                        && ui
+                            .button(format!("{} Discard {included}", icons::ARROW_COUNTER_CLOCKWISE))
+                            .on_hover_text("Throw away the changes to the chosen files")
+                            .clicked()
+                    {
+                        confirm = Some(st.files.iter().filter(|f| !view.unchecked.contains(&f.path)).map(|f| f.path.clone()).collect());
+                    }
+                });
+                help(ui, "Only files in this collection's folder are staged and committed; anything else in the repository is left alone.");
+            }
+            if !st.log.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Recent commits").strong().size(12.5));
+                egui::ScrollArea::vertical().id_salt("git-log").max_height(110.0).show(ui, |ui| {
+                    for c in &st.log {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&c.hash).monospace().size(12.0).color(p.faint));
+                            ui.add(egui::Label::new(RichText::new(&c.subject).size(12.5)).truncate());
+                            ui.label(RichText::new(format!("{} \u{b7} {}", c.author, c.when)).size(11.5).color(p.muted));
+                        });
+                    }
+                });
+            }
+        }
+        Some(Ok(_)) => {}
+    }
+    app.actions.extend(acts);
+    if let Some(paths) = confirm {
+        let n = paths.len();
+        app.modal = Some(Modal::Confirm {
+            message: format!("Throw away the uncommitted changes to {n} file{}? New files are deleted.", if n == 1 { "" } else { "s" }),
+            action: Confirm::GitDiscard { dir, paths },
+        });
+    }
+}
+
+/// A unified diff with added and removed lines coloured.
+fn diff_view(ui: &mut Ui, text: &str) {
+    let p = pal(ui);
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for line in text.lines().take(2000) {
+        let color = if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") {
+            p.faint
+        } else if line.starts_with('+') {
+            p.ok_text
+        } else if line.starts_with('-') {
+            p.err_text
+        } else if line.starts_with("@@") {
+            p.accent
+        } else {
+            p.text2
+        };
+        ui.add(egui::Label::new(RichText::new(line).monospace().size(12.0).color(color)).extend());
+    }
 }
 
 fn rename(app: &mut ApiCraftApp, ui: &mut Ui) {
@@ -323,18 +742,21 @@ fn import(app: &mut ApiCraftApp, ui: &mut Ui) {
 }
 
 fn confirm(app: &mut ApiCraftApp, ui: &mut Ui, message: &str) {
-    head(app, ui, "Delete");
+    let git = matches!(&app.modal, Some(Modal::Confirm { action: Confirm::GitDiscard { .. }, .. }));
+    head(app, ui, if git { "Discard changes" } else { "Delete" });
     let p = pal(ui);
     ui.horizontal_top(|ui| {
         ui.label(RichText::new(icons::TRASH).size(22.0).color(p.danger));
         ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.label(RichText::new(message).color(p.text));
-            ui.label(RichText::new("This can't be undone.").size(12.0).color(p.muted));
+            ui.label(
+                RichText::new(if git { "This can't be undone." } else { "Undo (Ctrl+Z, or the arrow at the top) brings it back." }).size(12.0).color(p.muted),
+            );
         });
     });
     foot(ui, |ui| {
-        if danger_button(ui, "Delete").clicked() {
+        if danger_button(ui, if git { "Discard" } else { "Delete" }).clicked() {
             app.actions.push(Action::Confirm);
         }
         if ui.button("Cancel").clicked() {

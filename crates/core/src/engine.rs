@@ -11,7 +11,7 @@ use crate::extract::{self, CheckResult, ResponseView};
 use crate::grpc::{self, GrpcResult};
 use crate::http::{ConnectOptions, HttpRequest, HttpResponse, Transport};
 use crate::ids::new_id;
-use crate::model::{Auth, Catalog, Check, Extraction, GrantType, KeyValue, Protocol, VarScope};
+use crate::model::{Auth, Catalog, Check, Compression, Extraction, GrantType, KeyValue, Protocol, SendOptions, VarScope};
 use crate::prepare::{multipart, prepare, Prepared, PreparedBody};
 use crate::url::Url;
 use crate::vars::Vars;
@@ -120,6 +120,66 @@ pub fn build_wire(catalog: &Catalog, request_id: &str, workflow_vars: &[KeyValue
     Ok(Wire { prepared, http, auth, auth_owner: owner, vars })
 }
 
+/// Fills in a request's automatic headers at send time: compresses the body
+/// (adding `Content-Encoding`), asks for compressed responses, and sets
+/// `Content-Length` to the size of the body as it goes out.
+pub fn apply_send_options(o: &SendOptions, http: &mut HttpRequest) -> Result<(), String> {
+    fn set(http: &mut HttpRequest, name: &str, value: String) {
+        http.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        http.headers.push((name.into(), value));
+    }
+    if o.compress != Compression::None && !http.body.is_empty() {
+        http.body = compress(&http.body, o.compress)?;
+        set(http, "Content-Encoding", o.compress.label().into());
+    }
+    if o.accept_compressed && !http.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")) {
+        http.headers.push(("Accept-Encoding".into(), "gzip, deflate".into()));
+    }
+    if o.content_length {
+        set(http, "Content-Length", http.body.len().to_string());
+    }
+    Ok(())
+}
+
+pub fn compress(bytes: &[u8], how: Compression) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let level = flate2::Compression::default();
+    let r = match how {
+        Compression::None => return Ok(bytes.to_vec()),
+        Compression::Gzip => {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), level);
+            e.write_all(bytes).and_then(|_| e.finish())
+        }
+        Compression::Deflate => {
+            // HTTP's "deflate" is the zlib format.
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), level);
+            e.write_all(bytes).and_then(|_| e.finish())
+        }
+    };
+    r.map_err(|e| format!("compressing the body: {e}"))
+}
+
+/// Unpacks a gzip or deflate response body that the sender left compressed.
+/// Bodies that don't unpack are left as they are.
+pub fn inflate_response(resp: &mut HttpResponse) {
+    use std::io::Read;
+    let Some(enc) = resp.header("content-encoding").map(|e| e.trim().to_ascii_lowercase()) else { return };
+    let mut out = Vec::new();
+    let ok = match enc.as_str() {
+        "gzip" | "x-gzip" if resp.body.starts_with(&[0x1f, 0x8b]) => flate2::read::MultiGzDecoder::new(&resp.body[..]).read_to_end(&mut out).is_ok(),
+        "deflate" => {
+            flate2::read::ZlibDecoder::new(&resp.body[..]).read_to_end(&mut out).is_ok() || {
+                out.clear();
+                flate2::read::DeflateDecoder::new(&resp.body[..]).read_to_end(&mut out).is_ok()
+            }
+        }
+        _ => false,
+    };
+    if ok {
+        resp.body = out;
+    }
+}
+
 /// Makes sure an OAuth 2 auth holds a usable token, fetching one if it can.
 /// Token requests go out with `connect` (the proxy and certificates).
 pub async fn ensure_oauth_token(o: &mut crate::model::OAuth2, connect: &ConnectOptions, transport: &dyn Transport) -> Result<Option<TokenResult>, String> {
@@ -198,6 +258,13 @@ pub async fn execute(
     }
 
     let mut http = wire.http.clone();
+    // Before signing, so signatures (AWS, OAuth 1) cover the body as sent.
+    if wire.prepared.grpc.is_none() && req.protocol != Protocol::Mcp {
+        if let Err(e) = apply_send_options(&req.send, &mut http) {
+            out.error = Some(e);
+            return out;
+        }
+    }
     if let Err(e) = auth::apply(&auth, &mut http, now) {
         out.error = Some(e);
         return out;
@@ -253,6 +320,11 @@ pub async fn execute(
                 ),
             }
         }
+    }
+
+    // Most senders unpack compressed responses themselves; catch the rest.
+    if wire.prepared.grpc.is_none() {
+        inflate_response(&mut resp);
     }
 
     // Decode the body.
@@ -559,5 +631,32 @@ pub(crate) mod tests {
         let o = pollster::block_on(execute(&cat, &rid, &[], &[], &[], &t));
         assert_eq!(o.response.unwrap().status, 200);
         assert!(t.sent.borrow()[1].headers.iter().any(|(k, v)| k == "Authorization" && v.starts_with("Digest username=\"Mufasa\"")));
+    }
+}
+
+#[cfg(test)]
+mod send_option_tests {
+    use super::*;
+
+    #[test]
+    fn compresses_sets_lengths_and_unpacks() {
+        let body = br#"{"hello":"world","items":[1,2,3,4,5,6,7,8,9,10]}"#.to_vec();
+        for how in [Compression::Gzip, Compression::Deflate] {
+            let mut http =
+                HttpRequest { method: "POST".into(), body: body.clone(), headers: vec![("content-length".into(), "1".into())], ..Default::default() };
+            let o = SendOptions { content_length: true, compress: how, accept_compressed: true };
+            apply_send_options(&o, &mut http).unwrap();
+            let header = |k: &str| http.headers.iter().filter(|(h, _)| h.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+            assert_eq!(header("content-encoding"), [how.label()]);
+            assert_eq!(header("content-length"), [http.body.len().to_string()], "replaces the user's value with the compressed size");
+            assert_eq!(header("accept-encoding"), ["gzip, deflate"]);
+            let mut resp = HttpResponse { headers: vec![("Content-Encoding".into(), how.label().into())], body: http.body.clone(), ..Default::default() };
+            inflate_response(&mut resp);
+            assert_eq!(resp.body, body);
+        }
+        // Already unpacked by the sender: left alone.
+        let mut resp = HttpResponse { headers: vec![("Content-Encoding".into(), "gzip".into())], body: body.clone(), ..Default::default() };
+        inflate_response(&mut resp);
+        assert_eq!(resp.body, body);
     }
 }

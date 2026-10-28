@@ -25,6 +25,12 @@ pub fn frame(app: &mut ApiCraftApp, ui: &mut Ui) {
             .size_range(220.0..=440.0)
             .frame(Frame::new().fill(p.sidebar).inner_margin(Margin { left: 10, right: 10, top: 12, bottom: 8 }))
             .show(ui, |ui| sidebar::show(app, ui));
+    } else {
+        egui::Panel::left("sidebar-rail")
+            .resizable(false)
+            .exact_size(56.0)
+            .frame(Frame::new().fill(p.sidebar).inner_margin(Margin { left: 6, right: 6, top: 12, bottom: 10 }))
+            .show(ui, |ui| sidebar::rail(app, ui));
     }
     egui::CentralPanel::default().frame(Frame::new().fill(p.surface)).show(ui, |ui| match app.view.clone() {
         View::Request(id) if app.catalog.find_request(&id).is_some() => request::show(app, ui, &id),
@@ -40,10 +46,7 @@ pub(crate) fn topbar(app: &mut ApiCraftApp, ui: &mut Ui, title: impl FnOnce(&mut
     let p = pal(ui);
     Frame::new().inner_margin(Margin { left: 14, right: 12, top: 8, bottom: 8 }).show(ui, |ui| {
         ui.horizontal(|ui| {
-            if !app.prefs.sidebar_open && widgets::icon_button(ui, icons::LIST, "Show sidebar").clicked() {
-                app.prefs.sidebar_open = true;
-            }
-            let tools_w = 470.0_f32.min(ui.available_width() * 0.6);
+            let tools_w = 540.0_f32.min(ui.available_width() * 0.62);
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width() - tools_w, 40.0), Layout::top_down(Align::Min), |ui| title(app, ui));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // theme
@@ -81,6 +84,14 @@ pub(crate) fn topbar(app: &mut ApiCraftApp, ui: &mut Ui, title: impl FnOnce(&mut
                     }
                 });
                 app.catalog.active_environment = active;
+                ui.add_space(4.0);
+                let redo = ui.add_enabled(app.history.can_redo(), egui::Button::new(RichText::new(icons::ARROW_U_UP_RIGHT).size(16.0)).frame(false));
+                if redo.on_hover_text("Redo (Ctrl+Y)").clicked() {
+                    app.actions.push(Action::Redo);
+                }
+                if widgets::icon_button(ui, icons::ARROW_U_UP_LEFT, "Undo (Ctrl+Z): brings back deleted steps, requests, folders and other changes").clicked() {
+                    app.actions.push(Action::Undo);
+                }
             });
         });
     });

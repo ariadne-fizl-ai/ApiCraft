@@ -9,7 +9,7 @@ use apicraft_core::model::*;
 use apicraft_core::{auth, curl_import, engine, format, postman, soap, store};
 
 use crate::app::{ApiCraftApp, Confirm, Modal, View, WorkflowRun, WsDir, WsEntry, WsSession};
-use crate::platform::{CodeExchange, FolderContents, FolderPurpose, Job};
+use crate::platform::{CodeExchange, CommandPurpose, FolderContents, FolderPurpose, Job};
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -26,6 +26,11 @@ pub enum Action {
     RenameSave,
     CollectionSettings(String),
     Duplicate(String),
+    /// A whole collection, or a folder and everything in it.
+    DuplicateCollection(String),
+    DuplicateFolder(String),
+    Undo,
+    Redo,
     AskDelete(String),
     Confirm,
     ExportCollectionGz(String),
@@ -69,6 +74,16 @@ pub enum Action {
     /// Drag and drop in the sidebar.
     MoveItem(String, MoveTo),
     SaveResponse,
+    /// Fetch every command-backed value of the active environment again.
+    FetchSources,
+    BitwardenUnlock,
+    BitwardenStatus,
+    BitwardenSync,
+    /// Forget the Bitwarden session key.
+    BitwardenLock,
+    Git(apicraft_core::git::GitRequest),
+    /// The collection dialog on its folder and Git tab.
+    CollectionFiles(String),
 }
 
 pub fn ancestors_of(cat: &Catalog, id: &str) -> Vec<String> {
@@ -215,6 +230,58 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
                 app.open_request(&new_id);
             }
         }
+        Action::DuplicateCollection(id) => {
+            if let Some(new_id) = app.catalog.duplicate_collection(&id) {
+                app.expanded.insert(new_id.clone());
+                let name = app.catalog.collection(&new_id).map(|c| c.name.clone()).unwrap_or_default();
+                app.modal = Some(Modal::Rename { id: new_id, value: name });
+            }
+        }
+        Action::DuplicateFolder(id) => {
+            if let Some(new_id) = app.catalog.duplicate_folder(&id) {
+                app.expanded.insert(new_id.clone());
+                let name = folder_name(&app.catalog, &new_id).unwrap_or_default();
+                app.modal = Some(Modal::Rename { id: new_id, value: name });
+            }
+        }
+        Action::Undo => app.undo(),
+        Action::Redo => app.redo(),
+        Action::FetchSources => {
+            if app.catalog.active_environment.is_none() {
+                return app.toast("Choose an environment first", true);
+            }
+            app.fetching_sources = true;
+            app.spawn(Job::FetchSources { catalog: Box::new(app.catalog.clone()), sources: app.source_ctx() });
+        }
+        Action::BitwardenUnlock => {
+            let pw = std::mem::take(&mut app.bitwarden.password);
+            if pw.is_empty() {
+                return app.toast("Enter your Bitwarden master password", true);
+            }
+            app.bitwarden.busy = true;
+            app.spawn(Job::Command { spec: apicraft_core::sources::bitwarden_unlock(&pw), purpose: CommandPurpose::BitwardenUnlock });
+        }
+        Action::BitwardenStatus => {
+            app.bitwarden.busy = true;
+            app.spawn(Job::Command { spec: apicraft_core::sources::bitwarden_status(&app.bitwarden.session), purpose: CommandPurpose::BitwardenStatus });
+        }
+        Action::BitwardenSync => {
+            app.bitwarden.busy = true;
+            app.spawn(Job::Command { spec: apicraft_core::sources::bitwarden_sync(&app.bitwarden.session), purpose: CommandPurpose::BitwardenSync });
+        }
+        Action::BitwardenLock => {
+            app.bitwarden.session.clear();
+            app.bitwarden.status = None;
+            app.source_values.clear();
+            app.toast("Forgot the Bitwarden session and fetched values", false);
+        }
+        Action::Git(request) => app.run_git(request),
+        Action::CollectionFiles(id) => {
+            if let Some(dir) = app.catalog.collection(&id).and_then(|c| c.directory.clone()) {
+                app.run_git(apicraft_core::git::GitRequest::Status { dir });
+            }
+            app.modal = Some(Modal::Collection { id, tab: crate::app::CollectionTab::Files });
+        }
         Action::AskDelete(id) => {
             let what = if app.catalog.collection(&id).is_some() {
                 "this collection and everything in it"
@@ -250,8 +317,9 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
                             app.open_request(&rid);
                         }
                     }
-                    app.toast("Deleted", false);
+                    app.toast("Deleted. Press Ctrl+Z (or Undo at the top) to bring it back.", false);
                 }
+                Confirm::GitDiscard { dir, paths } => app.run_git(apicraft_core::git::GitRequest::Discard { dir, paths }),
                 Confirm::DeleteEnv(id) => {
                     app.catalog.environments.retain(|e| e.id != id);
                     if app.catalog.active_environment.as_deref() == Some(&id) {
@@ -289,7 +357,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
                 );
             }
         }
-        Action::CopyCode(id, target) => match codegen::generate(&app.catalog, &id, app.platform.now_ms(), target) {
+        Action::CopyCode(id, target) => match codegen::generate(&app.job_catalog(), &id, app.platform.now_ms(), target) {
             Ok(code) => {
                 ctx.copy_text(code);
                 app.toast(if target == Target::Curl { "Copied as curl" } else { "Copied as PowerShell" }, false);
@@ -298,7 +366,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
         },
         Action::SaveCode(id, target) => {
             let name = app.catalog.find_request(&id).map(|(_, r)| r.name.clone()).unwrap_or_default();
-            match codegen::generate(&app.catalog, &id, app.platform.now_ms(), target) {
+            match codegen::generate(&app.job_catalog(), &id, app.platform.now_ms(), target) {
                 Ok(code) => app.platform.save_file(&format!("{}.{}", file_stem(&name), target.file_extension()), code.into_bytes(), app.inbox.clone()),
                 Err(e) => app.toast(e, true),
             }
@@ -326,7 +394,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
             }
             app.sending.insert(id.clone());
             app.resp_tab = crate::app::RespTab::Body;
-            app.spawn(Job::Execute { catalog: Box::new(app.catalog.clone()), request_id: id });
+            app.spawn(Job::Execute { catalog: app.job_catalog(), sources: app.source_ctx(), request_id: id });
         }
         Action::Cancel(id) => {
             app.sending.remove(&id);
@@ -359,7 +427,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
             let stop = Arc::new(AtomicBool::new(false));
             app.run = Some(WorkflowRun { workflow_id: id.clone(), running: true, stop: stop.clone(), reports: Vec::new(), summary: None, error: None });
             app.view = View::Workflow(id.clone());
-            app.spawn(Job::Workflow { catalog: Box::new(app.catalog.clone()), workflow_id: id, stop });
+            app.spawn(Job::Workflow { catalog: app.job_catalog(), sources: app.source_ctx(), workflow_id: id, stop });
         }
         Action::StopWorkflow => app.stop_workflow(),
         Action::DuplicateWorkflow(id) => {
@@ -377,7 +445,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
         Action::OAuthGet(owner) => oauth_get(app, &owner),
         Action::McpDiscover(id) => {
             if app.discovering.insert(id.clone()) {
-                app.spawn(Job::McpDiscover { catalog: Box::new(app.catalog.clone()), request_id: id });
+                app.spawn(Job::McpDiscover { catalog: app.job_catalog(), sources: app.source_ctx(), request_id: id });
             }
         }
         Action::OpenFolder => app.platform.pick_folder(FolderPurpose::Open, app.inbox.clone()),
@@ -396,7 +464,7 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
         }
         Action::FetchSchema(id) => {
             if app.discovering.insert(id.clone()) {
-                app.spawn(Job::FetchSchema { catalog: Box::new(app.catalog.clone()), request_id: id });
+                app.spawn(Job::FetchSchema { catalog: app.job_catalog(), sources: app.source_ctx(), request_id: id });
             }
         }
         Action::RequestsFromSchema(id) => requests_from_schema(app, &id),
@@ -494,11 +562,15 @@ pub fn folder_loaded(app: &mut ApiCraftApp, path: &str, purpose: FolderPurpose, 
                 c.directory = Some(path.to_string());
                 let note = format!("{} is now saved as files in {path}", c.name);
                 app.toast(note, false);
+                // Write the files now, so Git sees them straight away.
+                app.flush();
+                app.run_git(apicraft_core::git::GitRequest::Status { dir: path.to_string() });
             }
         }
         FolderPurpose::Reload(id) => {
             apicraft_core::folder::merge_linked(&mut app.catalog, &id, contents.collection, contents.workflows);
             app.toast("Reloaded from the folder", false);
+            app.flush();
         }
     }
 }
@@ -685,7 +757,7 @@ fn ws_connect(app: &mut ApiCraftApp, id: &str) {
         }
     }
     let now = app.platform.now_ms();
-    let wire = engine::build_wire(&app.catalog, id, &[], now, false).and_then(|mut w| {
+    let wire = engine::build_wire(&app.job_catalog(), id, &[], now, false).and_then(|mut w| {
         auth::apply(&w.auth, &mut w.http, now)?;
         Ok(w)
     });
