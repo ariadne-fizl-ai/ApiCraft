@@ -26,8 +26,12 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     /// Working folder; empty for the host's current one.
     pub cwd: String,
-    /// 0 means the default (60 seconds).
+    /// 0 means the default (60 seconds, or 5 minutes in a window).
     pub timeout_ms: u32,
+    /// Runs in a terminal window of its own so the user can answer prompts
+    /// (a master password, say) there rather than in the app. Only stdout
+    /// is captured; prompts and errors stay in the window.
+    pub window: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,9 +61,6 @@ impl CommandOutput {
 
 /// The Bitwarden fields `bw get` reads directly; anything else is a custom field.
 pub const BITWARDEN_FIELDS: [&str; 5] = ["password", "username", "totp", "notes", "uri"];
-
-/// The environment variable `bw unlock` reads the master password from.
-const BW_PASSWORD_ENV: &str = "APICRAFT_BW_PASSWORD";
 
 fn bw(args: &[&str], session: &str) -> CommandSpec {
     let mut env = Vec::new();
@@ -114,7 +115,7 @@ pub fn value_from(src: &VarSource, out: &CommandOutput) -> Result<String, String
                 return Err("Bitwarden is locked: unlock it in Environments \u{2192} Values from commands".into());
             }
             if lower.contains("not logged in") {
-                return Err("Bitwarden isn't logged in: run `bw login` once in a terminal".into());
+                return Err("Bitwarden isn't logged in: log in from Environments \u{2192} Values from commands".into());
             }
         }
         return Err(why);
@@ -144,12 +145,12 @@ pub fn value_from(src: &VarSource, out: &CommandOutput) -> Result<String, String
     }
 }
 
-/// `bw unlock`, giving the session key on stdout. The password travels in an
-/// environment variable of the child process, never on its command line.
-pub fn bitwarden_unlock(password: &str) -> CommandSpec {
-    let mut spec = bw(&["unlock", "--raw", "--passwordenv", BW_PASSWORD_ENV], "");
-    spec.env.push((BW_PASSWORD_ENV.into(), password.into()));
-    spec
+/// `bw unlock --raw` (or `bw login --raw` when not logged in yet) in a
+/// terminal window: the user types the master password into `bw` itself,
+/// and the session key comes back on stdout.
+pub fn bitwarden_unlock(logged_in: bool) -> CommandSpec {
+    let verb = if logged_in { "unlock" } else { "login" };
+    CommandSpec { program: "bw".into(), args: vec![verb.into(), "--raw".into()], window: true, ..Default::default() }
 }
 
 /// `bw sync`: pulls the latest vault.
@@ -258,8 +259,10 @@ mod tests {
         let s = spec_for(&src(SourceKind::Bitwarden, "api_key"), "").unwrap();
         assert_eq!(s.args, ["get", "item", "My API", "--nointeraction"]);
         assert!(s.env.is_empty());
-        let unlock = bitwarden_unlock("pw");
-        assert!(!unlock.args.iter().any(|a| a == "pw"), "the password never goes on the command line");
+        let unlock = bitwarden_unlock(true);
+        assert!(unlock.window, "the password is typed into bw, not the app");
+        assert_eq!(unlock.args, ["unlock", "--raw"]);
+        assert_eq!(bitwarden_unlock(false).args, ["login", "--raw"]);
     }
 
     #[test]

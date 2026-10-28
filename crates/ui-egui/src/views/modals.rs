@@ -275,7 +275,7 @@ fn bitwarden_panel(ui: &mut Ui, bw: &mut crate::app::Bitwarden, actions: &mut Ve
                 _ if !bw.session.is_empty() => ("unlocked for this session".to_string(), p.ok_text),
                 Some((s, email)) if s == "unlocked" => (format!("unlocked{}", if email.is_empty() { String::new() } else { format!(" ({email})") }), p.ok_text),
                 Some((s, email)) if s == "locked" => (format!("locked{}", if email.is_empty() { String::new() } else { format!(" ({email})") }), p.warn_text),
-                Some((s, _)) if s == "unauthenticated" => ("not logged in: run `bw login` in a terminal once".to_string(), p.err_text),
+                Some((s, _)) if s == "unauthenticated" => ("not logged in".to_string(), p.err_text),
                 Some((s, _)) => (s.clone(), p.muted),
                 None => ("status not checked".to_string(), p.muted),
             };
@@ -297,16 +297,21 @@ fn bitwarden_panel(ui: &mut Ui, bw: &mut crate::app::Bitwarden, actions: &mut Ve
         });
         if bw.session.is_empty() {
             ui.horizontal(|ui| {
-                let r = ui.add(TextEdit::singleline(&mut bw.password).password(true).hint_text("master password").desired_width(220.0));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(!bw.busy && !bw.password.is_empty(), egui::Button::new(format!("{} Unlock", icons::LOCK_OPEN))).clicked() || (enter && !bw.password.is_empty())
-                {
+                let (label, tip) = if bw.logged_in() {
+                    (format!("{} Unlock\u{2026}", icons::LOCK_OPEN), "Opens a terminal window running `bw unlock`; type your master password there")
+                } else {
+                    (format!("{} Log in\u{2026}", icons::LOCK_OPEN), "Opens a terminal window running `bw login`; sign in there")
+                };
+                if ui.add_enabled(!bw.busy, egui::Button::new(label)).on_hover_text(tip).clicked() {
                     actions.push(Action::BitwardenUnlock);
+                }
+                if bw.busy {
+                    ui.label(RichText::new("waiting for the Bitwarden window\u{2026}").size(12.5).color(p.muted));
                 }
             });
             help(
                 ui,
-                "Uses the Bitwarden CLI (bw), logged in once with `bw login`. Unlocking runs `bw unlock`; the session key stays in memory and the password is never stored. Skip this if BW_SESSION is already set where the app runs.",
+                "Uses the Bitwarden CLI (bw). Your master password is typed into bw in its own window, never into ApiCraft; only the session key comes back, and it's kept in memory. Skip this if BW_SESSION is already set where the app runs.",
             );
         }
     });

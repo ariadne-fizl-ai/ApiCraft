@@ -106,8 +106,15 @@ pub struct Bitwarden {
     pub session: String,
     /// What `bw status` last said (`unlocked`, `locked`, `unauthenticated`), and the account.
     pub status: Option<(String, String)>,
-    pub password: String,
     pub busy: bool,
+}
+
+impl Bitwarden {
+    /// Whether `bw unlock` will do, rather than `bw login`. Assumed until
+    /// `bw status` says otherwise.
+    pub fn logged_in(&self) -> bool {
+        !matches!(&self.status, Some((s, _)) if s == "unauthenticated")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -568,7 +575,6 @@ impl ApiCraftApp {
         };
         match purpose {
             CommandPurpose::BitwardenUnlock => {
-                self.bitwarden.password.clear();
                 if out.ok() && !out.stdout.trim().is_empty() {
                     self.bitwarden.session = out.stdout.trim().to_string();
                     self.bitwarden.status = Some(("unlocked".into(), self.bitwarden.status.take().map(|s| s.1).unwrap_or_default()));
@@ -577,6 +583,9 @@ impl ApiCraftApp {
                     self.toast("Bitwarden unlocked for this session", false);
                 } else {
                     self.toast(format!("Couldn't unlock Bitwarden: {}", out.failure()), true);
+                    // Maybe it needs `bw login` instead; find out for the button.
+                    self.bitwarden.busy = true;
+                    self.spawn(Job::Command { spec: sources::bitwarden_status(""), purpose: CommandPurpose::BitwardenStatus });
                 }
             }
             CommandPurpose::BitwardenStatus => match sources::parse_bitwarden_status(&out) {

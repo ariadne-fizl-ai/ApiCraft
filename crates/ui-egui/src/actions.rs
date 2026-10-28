@@ -254,12 +254,10 @@ pub fn apply(app: &mut ApiCraftApp, action: Action, ctx: &egui::Context) {
             app.spawn(Job::FetchSources { catalog: Box::new(app.catalog.clone()), sources: app.source_ctx() });
         }
         Action::BitwardenUnlock => {
-            let pw = std::mem::take(&mut app.bitwarden.password);
-            if pw.is_empty() {
-                return app.toast("Enter your Bitwarden master password", true);
-            }
+            // bw asks for the master password in a window of its own.
             app.bitwarden.busy = true;
-            app.spawn(Job::Command { spec: apicraft_core::sources::bitwarden_unlock(&pw), purpose: CommandPurpose::BitwardenUnlock });
+            let spec = apicraft_core::sources::bitwarden_unlock(app.bitwarden.logged_in());
+            app.spawn(Job::Command { spec, purpose: CommandPurpose::BitwardenUnlock });
         }
         Action::BitwardenStatus => {
             app.bitwarden.busy = true;
