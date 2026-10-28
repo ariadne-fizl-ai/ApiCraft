@@ -33,6 +33,7 @@ pub fn run(spec: &CommandSpec) -> Result<CommandOutput, String> {
         c.args(&spec.args);
         c
     } else if cfg!(windows) {
+        #[allow(unused_mut)]
         let mut c = command("cmd");
         #[cfg(windows)]
         {
