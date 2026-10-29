@@ -1,0 +1,44 @@
+<!--
+  Windows Installer package for Fizl ApiCraft (WiX Toolset v5).
+  `cargo xtask dist` builds it on Windows from the packaged release folder,
+  passing Version, PackageDir and LicenseRtf as -d variables.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Fizl ApiCraft" Manufacturer="Fizl Ltd" Version="$(Version)" UpgradeCode="BA5CD7FF-15A6-49FD-9660-043ACE0D1E96" Scope="perMachine">
+    <!-- Installing any version replaces the one already there. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- The .exe embeds the icon; an advertised shortcut's icon must be named like its target (ICE50). -->
+    <Icon Id="AppIcon.exe" SourceFile="$(PackageDir)\fizl-apicraft.exe" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/simonsoanes/ApiCraft" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Fizl ApiCraft" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="Fizl ApiCraft" AllowAbsent="no">
+      <Component Directory="INSTALLFOLDER">
+        <File Source="$(PackageDir)\fizl-apicraft.exe" KeyPath="yes">
+          <Shortcut Name="Fizl ApiCraft" Description="API client for REST, GraphQL, OData, SOAP, gRPC and WebSocket" Directory="ProgramMenuFolder" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.exe" Advertise="yes" />
+        </File>
+      </Component>
+      <!-- The agent, the web app and the licence files, keeping web\'s layout. -->
+      <Files Directory="INSTALLFOLDER" Include="$(PackageDir)\**">
+        <Exclude Files="$(PackageDir)\fizl-apicraft.exe" />
+      </Files>
+    </Feature>
+
+    <Feature Id="AgentOnPath" Title="Add apicraft-agent to PATH" Description="Lets you run apicraft-agent (the CLI and MCP server) from any terminal.">
+      <Component Directory="INSTALLFOLDER">
+        <RegistryValue Root="HKLM" Key="Software\Fizl\ApiCraft" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
+      </Component>
+    </Feature>
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+    <ui:WixUI Id="WixUI_FeatureTree" InstallDirectory="INSTALLFOLDER" />
+  </Package>
+</Wix>

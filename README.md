@@ -135,11 +135,26 @@ cargo xtask dist
 
 It builds release versions of everything and packages them for the OS it runs on:
 
-- **Windows:** a zip with `fizl-apicraft.exe` (icon embedded), `apicraft-agent.exe` and `web/`.
+- **Windows:** a zip with `fizl-apicraft.exe` (icon embedded), `apicraft-agent.exe` and `web/`, and an `.msi` installer of the same files. The installer adds a Start menu shortcut and, optionally, puts `apicraft-agent` on the system `PATH`; installing a newer version replaces the old one. It's built with the [WiX Toolset](https://wixtoolset.org/) v5, pinned as a local .NET tool in `dotnet-tools.json`, so it needs the .NET SDK (without it you just get the zip). The installer source is `apps/desktop/installer/fizl-apicraft.wxs`.
 - **macOS:** `Fizl ApiCraft.app`, zipped.
 - **Linux:** a tarball with a `.desktop` file and an icon.
 
 `.github/workflows/build.yml` runs the checks and builds all three in CI; Gitea Actions reads that folder too. Run `cargo xtask ci` for the same checks locally: formatting, clippy, tests and a wasm build.
+
+### Hosting the web app with Docker
+
+```bash
+docker build -t fizl-apicraft-web .
+docker run --rm -p 8080:8080 fizl-apicraft-web
+```
+
+The image is just the browser build (release wasm, run through `wasm-opt`) on `nginx-unprivileged`: it runs as a non-root user on port 8080 and serves pre-compressed files. CI builds it for `linux/amd64` and `linux/arm64` and pushes it to `ghcr.io/<owner>/fizl-apicraft-web` from `master` and `v*` tags.
+
+The agent isn't in the image, because it's a local proxy that can start processes and isn't meant to be reachable over a network. Requests from the hosted app go straight from the browser, with the CORS limits described below. To lift them, a user runs the agent on their own machine and lets the hosted page use it:
+
+```bash
+apicraft-agent serve --allow-origin https://apicraft.example.com
+```
 
 ## How values flow between requests
 

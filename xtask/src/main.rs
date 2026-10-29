@@ -17,6 +17,7 @@ cargo xtask <task> [--release]
   web        Build the browser app into dist/web (wasm-bindgen output + web/ shell)
   serve      Build the browser app, then serve it with the agent at http://127.0.0.1:8787/
   dist       Release builds of everything, packaged for this OS under dist/
+             (on Windows also an .msi installer, via the WiX Toolset in dotnet-tools.json)
   icons      Regenerate the app icons in apps/desktop/assets/ from apicraft_ui::brand
   ci         Formatting, clippy, tests and a wasm build: what CI runs
 
@@ -275,6 +276,60 @@ fn dist() -> Result<(), String> {
     }
     run(c)?;
     eprintln!("packaged {}", dist.join(archive).display());
+    if os == "windows" {
+        if have("dotnet") {
+            msi(&pkg, &dist.join(format!("{name}.msi")), &ver)?;
+        } else {
+            eprintln!("warning: no .msi (needs the .NET SDK for the WiX Toolset; see dotnet-tools.json)");
+        }
+    }
+    Ok(())
+}
+
+/// The licence as RTF, for the installer's licence page.
+fn rtf(text: &str) -> String {
+    let mut out = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\f0\\fs18 ");
+    for ch in text.chars() {
+        match ch {
+            '\\' | '{' | '}' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\r' => {}
+            '\n' => out.push_str("\\par\n"),
+            c if c.is_ascii() => out.push(c),
+            c => out.push_str(&format!("\\u{}?", c as u32 as i16)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// Builds the Windows Installer package from the packaged folder with the
+/// WiX Toolset, pinned as a local dotnet tool in dotnet-tools.json.
+fn msi(pkg: &Path, out: &Path, ver: &str) -> Result<(), String> {
+    let wix = || {
+        let mut c = Command::new("dotnet");
+        c.current_dir(root()).arg("wix");
+        c
+    };
+    let mut c = Command::new("dotnet");
+    c.current_dir(root()).args(["tool", "restore"]);
+    run(c)?;
+    let mut c = wix();
+    c.args(["extension", "add", "WixToolset.UI.wixext/5.0.2"]);
+    run(c)?;
+    let license = root().join("target/fizl-apicraft-license.rtf");
+    fs::write(&license, rtf(&fs::read_to_string(root().join("LICENSE")).map_err(|e| e.to_string())?)).map_err(|e| e.to_string())?;
+    let mut c = wix();
+    c.arg("build").arg(root().join("apps/desktop/installer/fizl-apicraft.wxs"));
+    c.args(["-arch", arch(), "-ext", "WixToolset.UI.wixext", "-pdbtype", "none"]);
+    c.arg("-d").arg(format!("Version={ver}"));
+    c.arg("-d").arg(format!("PackageDir={}", pkg.display()));
+    c.arg("-d").arg(format!("LicenseRtf={}", license.display()));
+    c.arg("-o").arg(out);
+    run(c)?;
+    eprintln!("packaged {}", out.display());
     Ok(())
 }
 
